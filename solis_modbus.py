@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-Solis PV grid-connected inverter reader - Modbus RTU over RS485.
+Solis hybrid (energy storage) inverter reader - Modbus RTU over RS485.
 
-Implements the read side (function code 0x04, input registers) of
-"RS485_MODBUS Solis PV Grid-Connected Inverter" protocol V19.
+Implements the read side of "RS485_MODBUS (ESINV-33000ID) Hybrid Inverter",
+Communication Protocol for Energy Storage Inverters Ver3.5.
 
 Protocol notes (from the PDF):
-  * 9600 bps, 8N1, slave address 1..247
-  * >= 300 ms between frames, max ~50 registers per request
-  * Registers in section 5.2 (3000-3999) are sent with address - 1
-    (e.g. register 3000 is requested as 0x0BB7 = 2999)
-  * Register 35000 (section 5.1) is sent as-is, no offset
-  * U32/S32: high word first
+  * 9600 bps, 8N1, default slave address 1
+  * >= 300 ms between query frames
+  * Register addresses are sent exactly as listed (no -1 offset):
+    33001 is requested as 0x80E9 (protocol example 7.1)
+  * FC04 input registers: 33000-36999, 25000-25999 (live data)
+    FC03 holding registers: 43000-44999 (settings)
+  * Unimplemented registers return 0x0000 instead of an exception
+  * U32/S32: high word first. 0x80000000 marks an invalid S32 value
 
 Only dependency: pyserial  (pip install pyserial)
 
 Examples:
   python solis_modbus.py --list-ports
-  python solis_modbus.py --port COM5
-  python solis_modbus.py --port COM5 --unit 1 --groups info,energy,ac,dc,status
+  python solis_modbus.py --port /dev/serial0
+  python solis_modbus.py --port COM5 --groups battery,pv,grid,load
+  python solis_modbus.py --port COM5 --groups all
   python solis_modbus.py --port COM5 --json
   python solis_modbus.py --port COM5 --interval 60 --csv solis_log.csv
 """
@@ -42,13 +45,13 @@ from typing import Callable
 
 MAX_REGS_PER_READ = 50
 INTER_FRAME_DELAY = 0.30  # seconds, protocol section 3.2
+NO_REPLY_ABORT = 2        # give up a poll after this many timeouts with no reply at all
 
 EXCEPTION_TEXT = {
     0x01: "illegal function code",
     0x02: "illegal data address",
     0x03: "illegal data value",
-    0x04: "service failure",
-    0x05: "HMI/DSP communication failure",
+    0x04: "service fault",
 }
 
 
@@ -81,6 +84,10 @@ class ModbusTimeout(ModbusError):
     pass
 
 
+class NoResponse(ModbusError):
+    pass
+
+
 class RtuClient:
     def __init__(self, port: str, unit: int, baud: int = 9600, timeout: float = 1.0, retries: int = 1):
         import serial  # imported here so --help works without pyserial
@@ -105,8 +112,8 @@ class RtuClient:
         if dt < INTER_FRAME_DELAY:
             time.sleep(INTER_FRAME_DELAY - dt)
 
-    def _transact(self, fc: int, wire_addr: int, count: int) -> list[int]:
-        req = with_crc(struct.pack(">BBHH", self.unit, fc, wire_addr, count))
+    def _transact(self, fc: int, addr: int, count: int) -> list[int]:
+        req = with_crc(struct.pack(">BBHH", self.unit, fc, addr, count))
         self._wait_gap()
         self.ser.reset_input_buffer()
         self.ser.write(req)
@@ -115,14 +122,14 @@ class RtuClient:
             head = self.ser.read(3)
             if len(head) < 3:
                 raise ModbusTimeout(f"no response (got {len(head)} bytes)")
-            addr, rfc, n = head
+            rid, rfc, n = head
             if rfc == fc | 0x80:
                 tail = self.ser.read(2)
                 frame = head + tail
                 if len(tail) < 2 or crc16(frame[:-2]) != struct.unpack("<H", frame[-2:])[0]:
                     raise ModbusError("bad CRC on exception response")
                 raise ModbusException(n)
-            if addr != self.unit or rfc != fc:
+            if rid != self.unit or rfc != fc:
                 raise ModbusError(f"unexpected header {head.hex(' ')}")
             if n != count * 2:
                 raise ModbusError(f"byte count {n}, expected {count * 2}")
@@ -136,11 +143,11 @@ class RtuClient:
         finally:
             self._last = time.monotonic()
 
-    def read_input(self, wire_addr: int, count: int) -> list[int]:
+    def read(self, fc: int, addr: int, count: int) -> list[int]:
         last: Exception | None = None
         for _ in range(self.retries + 1):
             try:
-                return self._transact(0x04, wire_addr, count)
+                return self._transact(fc, addr, count)
             except ModbusException:
                 raise  # deterministic answer, retrying won't help
             except ModbusError as e:
@@ -152,177 +159,152 @@ class RtuClient:
 # Lookup tables (appendices)
 # --------------------------------------------------------------------------
 
+# Appendix 1 (M35000)
 INVERTER_TYPE = {
-    0x1110: "Single phase inverter (0.7-8K1P / 7-10K1P / no-screen)",
-    0x1111: "Single phase microinverter (0.6-0.8K1P)",
-    0x1120: "Three phase inverter (5-25K3P / 5-30K3P(K2) no-screen)",
-    0x1121: "Three phase inverter (25-136K / 3-30K3P(K3) no-screen)",
-    0x1123: "Three phase inverter (MAX/PRO)",
-    0x1124: "Three phase inverter (320K)",
+    0x0000: "Undefined",
+    0x2030: "5G/S5 single-phase LV battery hybrid",
+    0x2031: "5G/S5 single-phase AC-coupled",
+    0x2060: "5G three-phase HV battery hybrid",
+    0x2070: "S6 three-phase HV battery 5-12kW",
+    0x2071: "S6 three-phase HV battery 12-20kW", 0x2171: "S6 three-phase HV battery 12-20kW",
+    0x2172: "S6 three-phase LV battery 10-15kW",
+    0x2073: "S6 three-phase HV battery 29.9-150kW", 0x2173: "S6 three-phase HV battery 29.9-150kW",
+    0x2273: "S6 three-phase HV battery 29.9-150kW",
+    0x2074: "S6 three-phase HV 5-10kW AC-coupled Pro",
+    0x2080: "S6 single-phase HV battery US",
+    0x2181: "S6 single-phase LV battery 12-16kW US",
+    0x2183: "S6 LV battery 5-8kW Brazil split-phase",
+    0x2090: "S6 single-phase LV battery 3-18kW", 0x2190: "S6 single-phase LV battery 3-18kW",
+    0x2091: "S6 single-phase LV battery AC-coupled",
+    0x3010: "S5 single-phase LV battery off-grid",
+    0x3020: "S6 single-phase LV battery off-grid", 0x3120: "S6 single-phase LV battery off-grid",
 }
 
-AC_OUTPUT_TYPE = {0: "Single phase", 1: "Three-phase four-wire", 2: "Phase three-wire", 3: "Three-phase three-wire"}
-
-WORKING_MODE = {
-    0: "No response mode", 1: "Volt-watt default", 2: "Volt-var", 3: "Fixed power factor",
-    4: "Fixed reactive power", 5: "Power-PF", 6: "Rule21 Volt-watt (US)",
-}
-
-POWER_LIMIT_SWITCH = {0xAA: "Enabled", 0x55: "Disabled (100%)"}
-REACTIVE_SWITCH = {0x55: "Off (PF=1, Q=0)", 0xA1: "Reactive power ratio active", 0xA2: "Power factor setting active"}
-INSTALL_METHOD = {0: "90 deg", 1: "15 deg"}
-EPM_HARD_SWITCH = {0: "Null", 1: "ON", 2: "OFF"}
-CT_LINK = {0: "Connected", 1: "Connection failed", 2: "Cannot judge"}
-G100_STATE = {1: "Normal", 2: "Overrun", 3: "Fault", 4: "Off"}
-ITALY_FULL_TEST = {1: "Single self-test", 2: "Full self-test"}
-VRT_FLAG = {0xA5: "VRT disabled", 0x5A: "VRT enabled"}
-AFCI_BOARD = {0: "Old AFCI", 1: "Lingshi detection board", 2: "TI detection board"}
-STD_SELECT = {0: "Invalid", 1: "Waiting for selection", 2: "Setting standard", 3: "Standard set"}
-IGBT_SELFCHECK = {0: "Not triggered", 1: "Triggering", 2: "Trigger success", 4: "Self-test ended"}
-RESET_ENABLE = {0x00: "Disabled", 0x59: "Enabled"}
-RESET_CMD = {0x00: "Disabled", 0x45: "Enabled"}
-METER_485 = {0: "Meter communication", 1: "Dual 485"}
-PV_COMBO = {0x0000: "1 voltage : 2 currents", 0x0003: "1 voltage : 3 currents"}
-PERF_NORMAL = {1: "CAT_A", 2: "CAT_B"}
-PERF_ABNORMAL = {1: "CAT_I", 2: "CAT_II", 3: "CAT_III"}
-MANUFACTURER = {0: "Null", 1: "Ginlong"}
-IV_TYPE = {0: "Undefined", 1: "60-point IV curve", 2: "128-point IV curve"}
-IV_SCAN = {
-    0x00: "Not configured", 0x10: "Request processing", 0x11: "Request failed", 0x12: "Request succeeded",
-    0x20: "Turning on IV scan", 0x21: "Unable to start IV scan", 0x22: "IV scan on",
-    0x30: "Scanning", 0x31: "Scan failed", 0x32: "Scan successful",
-    0x40: "HMI getting DSP data", 0x41: "HMI failed to get DSP data", 0x42: "HMI got DSP data",
-}
-OFF_ON = {0: "Off", 1: "On"}
-NO_YES = {0: "No", 1: "Yes"}
-
-# Appendix 1 - inverter status (3044); 3030 holds the sub-code
+# Appendix 3 (M33095); 33070 holds the sub-code
 STATUS = {
-    0x0000: "Waiting", 0x0001: "OpenRun", 0x0002: "SoftRun", 0x0003: "Generating",
-    0x1004: "Grid Off",
+    0x0000: "Waiting", 0x0001: "OpenRun", 0x0002: "SoftRun", 0x0003: "Generating", 0x0004: "Off-Grid",
+    0xF010: "Grid surge (Surge Alarm)", 0xF011: "Internal fan fault", 0xF013: "Grid SPD fault (VgSpdFail)",
+    0xF014: "DC SPD fault (DcSpdFail)", 0xF015: "External fan fault", 0xF016: "Fuse fault",
+    0xF017: "L&PE fail", 0xF019: "Boost fail", 0xF01A: "Generator start fail", 0xF01B: "Generator stop fail",
+    0xF01C: "IGBT temperature difference", 0xF01D: "N-PE voltage fault", 0xF01E: "PV/battery power mismatch",
+    0xF01F: "Generator phase error",
+    **{0xF020 + i: f"BMS alarm (warning) {i + 1:02d}" for i in range(14)},
+    0xF035: "AC Coupling lock", 0xF036: "AC Coupling stop", 0xF037: "Backup breaker overload",
+    0xF040: "CT direction fail", 0xF041: "Meter phase sequence warning", 0xF042: "Slave phase sequence warning",
+    0xF050: "Grid voltage unbalance warning", 0xF051: "DC switch abnormal warning",
+    0xF080: "Grid-tied inverter comm fail", 0xF081: "Meter 2 fail", 0xF082: "Parallel version mismatch",
+    0xF083: "Load cut-off (grid import over limit)", 0xF084: "Load cut-off lock",
     0x1010: "Grid over voltage (OV-G-V)", 0x1011: "Grid under voltage (UN-G-V)",
     0x1012: "Grid over frequency (OV-G-F)", 0x1013: "Grid under frequency (UN-G-F)",
     0x1014: "Grid reverse (Backfeed_Iac)", 0x1015: "No grid (NO-Grid)", 0x1016: "Grid unbalance (G-PHASE)",
     0x1017: "Grid frequency fluctuation (G-F-FLU)", 0x1018: "Grid over current (OV-G-I)",
-    0x1019: "Grid current tracking fault (IGFOL-F)", 0x101A: "Grid phase abnormal",
-    0x101C: "IGBT shift fault", 0x101D: "G100 voltage protection",
+    0x1019: "Grid current tracking fault (IGFOL-F)", 0x101A: "Grid phase fault",
+    0x101C: "Overcurrent screening fault (IGBTSift-Pro)", 0x101D: "G100 voltage protection",
+    0x101E: "Grid fluctuation abnormal (GV-F)",
     0x1020: "DC over voltage (OV-DC)", 0x1021: "DC bus over voltage (OV-BUS)",
     0x1022: "DC bus unbalance (UNB-BUS)", 0x1023: "DC bus under voltage (UN-BUS)",
-    0x1024: "DC bus unbalance 2 (UNB2-BUS)", 0x1025: "DC channel A over current (OV-DCA-I)",
-    0x1026: "DC channel B over current (OV-DCB-I)", 0x1027: "DC interference (DC-INTF)",
-    0x1028: "DC reverse (Reve-DC)", 0x1029: "PV mid-point grounding (PvMidIso)",
-    0x102A: "Master/slave bus voltage inconsistent (Vbus-Sam)",
-    0x1030: "Grid interference protection (GRID-INTF)", 0x1031: "DSP initial protection (INI-FAULT)",
-    0x1032: "Temperature protection (OV-TEM01)", 0x1033: "PV insulation fault (PV ISO-PRO)",
-    0x1034: "Leakage current protection (ILeak-PRO)", 0x1035: "Relay protection (RelayChk-FAIL)",
-    0x1036: "DSP_B communication fault", 0x1037: "DC injection protection (DCInj-FAULT)",
-    0x1038: "12V under voltage (12Power-FAULT)", 0x1039: "Leakage current check (ILeak-Check)",
-    0x103A: "Under temperature protection (UN-TEM)", 0x103D: "L&PE fault",
-    0x103E: "NTC over temperature (OV-TEM02)",
-    0x1040: "AFCI check fault", 0x1041: "AFCI arc fault (ARC-FAULT)", 0x1046: "Grid interference 02",
-    0x1047: "Grid current sampling error (IG-AD)", 0x1048: "IGBT over current (IGBT-OV-I)",
+    0x1024: "DC bus unbalance 2 (UNB2-BUS)", 0x1025: "DC channel A over current", 0x1026: "DC channel B over current",
+    0x1027: "DC interference (DC-INTF)", 0x1028: "DC reverse (Reve-DC)", 0x1029: "PV mid-point grounding",
+    0x102A: "Bus voltage inconsistent (Vbus-Sam)", 0x102B: "PV port surge", 0x102C: "DC over temperature (OV-TEM05)",
+    0x102D: "MPPT over voltage", 0x102E: "MPPT over current",
+    0x1030: "Grid interference (GRID-INTF)", 0x1031: "DSP init protection (INI-FAULT)",
+    0x1032: "Over temperature (OV-TEM01)", 0x1033: "PV insulation fault (PV ISO-PRO)",
+    0x1034: "Leakage current protection (ILeak-PRO)", 0x1035: "Relay check fail",
+    0x1036: "DSP_B communication fault", 0x1037: "DC injection fault (DCInj-FAULT)",
+    0x1038: "12V under voltage (12Power-FAULT)", 0x1039: "Leakage current self-check (ILeak-Check)",
+    0x103A: "Under temperature (UN-TEM)", 0x103B: "IGBT temperature difference", 0x103C: "Grid disturbance 02",
+    0x103D: "L&PE fault", 0x103E: "NTC over temperature (OV-TEM02)", 0x103F: "AC terminal over temperature (OV-TEM03)",
+    0x1040: "AFCI self-check fault", 0x1041: "Arc fault (ARC-FAULT)", 0x1046: "Grid interference 02",
+    0x1047: "Grid current sampling error (IG-AD)", 0x1048: "Grid level-3 over voltage (OV03-G-V)",
     0x1050: "Grid side instantaneous over current (OV-IgTr)", 0x1051: "DC bus hardware over voltage (OV-BUS-H)",
-    0x1052: "LLC hardware over current (OV-ILLC)", 0x1053: "EPM hard limit / battery over voltage",
-    0x1054: "Battery under voltage (UN-Vbatt)", 0x1055: "Battery not connected",
-    0x1056: "Bypass over voltage (OV-VBackup)", 0x1057: "Bypass overload (Over-Load)",
-    0x1058: "DSP self-check exception", 0x1059: "Vg sampling exception", 0x105A: "DSP hardware mismatch",
-    0x105B: "Battery over current (BAT-DOC)",
-    0x2010: "Fail Safe", 0x2011: "Fail Safe", 0x2012: "Battery communication failure",
-    0x2014: "DSP communication failure", 0x2015: "BMS alarm 1", 0x2016: "Inconsistent battery selection",
-    0x2017: "BMS alarm 2", 0x2018: "DRM connection failed", 0x2019: "Abnormal meter selection",
-    0x201A: "CT connect error", 0x201B: "DRM control off grid",
-    0x2020: "Lead-acid high ambient temperature", 0x2021: "Lead-acid low ambient temperature",
-    0x2030: "Backup overload (BKAC Overload)", 0x2040: "EPM hard limit protection",
-    0x2041: "AFCI board communication fail", 0x2042: "AFCI board CT module fail",
-    0x2043: "G100 overcurrent protection",
-    0xF010: "Grid surge (warning)", 0xF011: "Fan fault (warning)", 0xF013: "AC SPD error (warning)",
-    0xF014: "DC SPD error (warning)", 0xF015: "External fan fault (warning)", 0xF016: "Fuse alarm (warning)",
-    0xF017: "AC phase ground fault (warning)", 0xF018: "DSP communication error (warning)",
-    0xF019: "Boost error", 0xF01C: "IGBT temperature difference",
+    0x1052: "LLC hardware over current (OV-ILLC)", 0x1053: "EPM hard limit", 0x1057: "Load overload (Over-Load)",
+    0x1058: "DSP self-check fault", 0x1059: "Vg sampling fault", 0x105A: "DSP hardware mismatch",
+    0x105D: "DC bus hardware over voltage (storage)",
+    0x1800: "DC average over current (OV-DC-I)", 0x1801: "DC input over voltage (OV-DC)",
+    0x2010: "Fail Safe", 0x2011: "Fail Safe", 0x2012: "Battery communication fail", 0x2014: "DSP communication fail",
+    0x2018: "DRM link fail", 0x201A: "CT fault", 0x201B: "DRM control off grid",
+    0x2040: "EPM hard limit protection", 0x2041: "AFCI board comm fail", 0x2042: "AFCI board CT module fail",
+    0x2043: "G100 overcurrent protection", 0x2044: "Multiple masters configured", 0x2045: "SPH communication fail",
+    0x2046: "Parallel slave comm error", 0x2047: "Panel over current", 0x2048: "Low battery (off-grid)",
+    0x204A: "Inverter bridge hard limit", 0x204B: "G100 meter comm fail", 0x204C: "G100 CT fault",
+    0x204D: "AFCI board type mismatch", 0x2804: "Battery 1 wiring error", 0x2805: "Battery 2 wiring error",
 }
 STATUS_SUB = {
-    (0x0000, 1): "Grid Off (controlled)",
+    (0x0000, 1): "Grid Off (controlled)", (0x0000, 2): "Waiting01",
     (0x1020, 3): "PV ground fault", (0x1020, 4): "DC boost fault",
     (0x1036, 1): "DSP_B sampling fault",
-    (0x101D, 1): "Static overvoltage 1", (0x101D, 2): "Static overvoltage 2",
-    (0x101D, 3): "Dynamic overvoltage", (0x101D, 4): "Static undervoltage 1",
-    (0x101D, 5): "Static undervoltage 2", (0x101D, 6): "Dynamic undervoltage",
+    (0x101D, 1): "G100 static overvoltage 1", (0x101D, 2): "G100 static overvoltage 2",
+    (0x101D, 3): "G100 dynamic overvoltage", (0x101D, 4): "G100 static undervoltage 1",
+    (0x101D, 5): "G100 static undervoltage 2", (0x101D, 6): "G100 dynamic undervoltage",
 }
 GENERATING_LIMITS = {
-    0x0001: "LimByTemp", 0x0002: "LimByFreq", 0x0004: "LimByVg", 0x0008: "LimByVar",
-    0x0010: "LimByUnFr", 0x0020: "Ramp-up", 0x0040: "Overload", 0x0100: "LimByDRM", 0x0200: "LimByEPM",
+    0x0001: "LimByTemp", 0x0002: "LimByFreq", 0x0004: "LimByVg", 0x0008: "LimByVar", 0x0010: "LimByUnFr",
+    0x0020: "Ramp-up", 0x0040: "Overload", 0x0080: "LimByACTemp", 0x0100: "LimByDRM", 0x0200: "LimByEPM",
 }
 
-# Appendix 2 - bit definitions
-BITS_3095 = {0: "LimByTemp", 1: "LimByFreq", 2: "LimByVg", 3: "LimByVar", 4: "LimByUnFr",
-             5: "Ramp-up", 6: "Overload", 8: "LimByDRM", 9: "LimByEPM"}
-BITS_FAULT1 = {
-    0: "Grid AB overvoltage", 1: "Grid BC overvoltage", 2: "Grid CA overvoltage",
-    3: "Grid AB undervoltage", 4: "Grid BC undervoltage", 5: "Grid CA undervoltage",
-    6: "Grid over frequency", 7: "Grid under frequency", 8: "Grid unbalance",
-    10: "Grid frequency fluctuation", 11: "Grid phase abnormal", 12: "No grid", 13: "Grid reverse",
-    14: "Grid AB transient overvoltage", 15: "Hardware overcurrent screening failure",
+# Appendix 4
+BITS_33121 = {
+    0: "Normal operation", 1: "Initial standby", 2: "Shutdown", 3: "Fault", 4: "Standby",
+    5: "Derated (temp/freq)", 6: "Limited power (external)", 7: "Bypass overload", 8: "Load fault",
+    9: "Grid fault", 10: "Battery fault", 12: "Grid surge", 13: "Fan fault", 14: "External fan fault",
+    15: "Fault shutdown",
 }
-BITS_FAULT2 = {
-    0: "DC over voltage 01", 1: "DC over voltage 02", 2: "DC reverse",
-    3: "Master/slave bus voltage inconsistent", 4: "DC bus over voltage", 5: "DC bus under voltage",
-    6: "DC bus unbalance", 7: "DC bus voltage detection abnormal",
-    8: "Grid AB average overvoltage", 9: "Grid BC average overvoltage", 10: "Grid CA average overvoltage",
-    11: "PV mid-point grounding", 12: "DC boost fault", 13: "DC hardware overcurrent",
-    14: "Grid current tracking fault", 15: "Grid voltage instantaneous overvoltage",
+BITS_33339 = {
+    0: "Generator start failure", 1: "Generator stop failure", 2: "PV/battery power mismatch",
+    3: "Generator voltage/phase abnormal", 4: "SolisHub-DSP comm fault", 5: "AC-coupling locked",
+    6: "AC-coupling suspended", 7: "Backup breaker overload", 8: "Grid-tied inverter comm failure",
+    9: "Meter 2 abnormal", 10: "Master/slave software mismatch", 11: "Load unloaded (grid draw over limit)",
+    12: "Load unload locked",
 }
-BITS_FAULT3 = {
-    0: "Phase A overcurrent", 1: "Phase B overcurrent", 2: "Phase C overcurrent",
-    3: "DC1 average overcurrent", 4: "DC2 average overcurrent", 5: "AC hardware overcurrent",
-    6: "DC component of current exceeds limit",
-    7: "Grid AB overvoltage 02", 8: "Grid BC overvoltage 02", 9: "Grid CA overvoltage 02",
-    10: "Grid AB undervoltage 02", 11: "Grid BC undervoltage 02", 12: "Grid CA undervoltage 02",
-    13: "Grid overfrequency 02", 14: "Grid underfrequency 02", 15: "Grid overvoltage 03",
+BITS_33123 = {0: "Volt-watt", 1: "Volt-var", 2: "Fixed PF", 3: "Fixed reactive power", 4: "Power-PF", 5: "Power-Q"}
+# Appendix 7 (43110)
+BITS_43110 = {
+    0: "Self-consumption mode", 1: "Optimized revenue V1", 2: "Off-grid mode", 3: "Battery wake-up",
+    4: "Backup battery (reserve SOC)", 5: "Grid charging allowed", 6: "Feed-in priority mode",
+    7: "Night over-discharge retention", 10: "Battery conditioning", 11: "Peak-shaving mode",
 }
-BITS_FAULT4 = {
-    0: "Battery overcurrent", 1: "Module over temperature", 2: "System over temperature",
-    3: "Relay failure", 4: "PV midpoint grounding", 5: "Low temperature protection",
-    6: "Negative ground fault", 7: "Positive ground fault", 8: "12V undervoltage",
-    9: "Leakage current 01 (30mA)", 10: "Leakage current 02 (60mA)", 11: "Leakage current 03 (150mA)",
-    12: "Leakage current 04 (300mA)", 13: "Leakage current sensor failure", 14: "Grid disturbance 02",
-    15: "Grid current sampling abnormal",
+BITS_LG = {0: "Fully charged", 1: "Fully discharged", 2: "CB closed", 3: "Power-saving unavailable"}
+BITS_25003 = {
+    0: "Ready for remote control", 1: "Limited by BMS", 2: "Limited by inverter", 3: "Limited by grid frequency",
+    4: "Limited by grid voltage", 5: "Limited by ramp-up", 6: "Limited by DRM", 7: "Limited by EPM",
+    8: "Limited by grid peak power", 9: "Limited by reactive power",
 }
-BITS_FAULT5 = {
-    0: "Grid side instantaneous overcurrent", 1: "Battery/Vbus overvoltage hardware failure",
-    2: "LLC hardware overcurrent", 3: "Battery overvoltage detection", 4: "Battery undervoltage detection",
-    5: "AC level 2 hardware overcurrent", 6: "Master-slave DSP communication abnormal",
-    7: "Anomaly detected from DSP", 8: "AFCI self-test failure", 9: "AFCI failure",
-    10: "Battery not connected", 11: "DSP self-test abnormal", 12: "Grid voltage sampling abnormal",
-    13: "DSP software/hardware mismatch", 14: "Inverter overvoltage", 15: "Load overload",
+BITS_ONLINE = {i: f"ID{i}" for i in range(1, 32)}
+
+# Appendix 5 / 6 (43009 low byte = LV battery, high byte = HV battery)
+LV_BATTERY = {
+    0x00: "No battery", 0x01: "Pylontech LV", 0x03: "BYD B-Box LV", 0x04: "Dyness LV", 0x05: "PureDrive LV",
+    0x06: "LG Chem LV", 0x07: "AoBo LV", 0x08: "JiaWei LV", 0x09: "WECO LV", 0x0A: "FreedomWon LV",
+    0x0B: "Soluna LV", 0x0C: "GSL LV", 0x0D: "Rita LV", 0x0E: "GS Energy Risen LV", 0x0F: "Alpha LV",
+    0x10: "UZ Energy", 0x11: "ATL LV", 0x12: "Zeta LV", 0x13: "Highstar LV", 0x14: "KODAK LV", 0x15: "FOX LV",
+    0x16: "EXIDE LV", 0x17: "HD Energy LV", 0x18: "Pytes LV", 0x19: "ARVIO LV", 0x1A: "PAND LV", 0x1B: "WANKE LV",
+    0x1C: "Dowell LV", 0x1D: "ROSEN ESS", 0x1E: "ZRGP LV", 0x1F: "Narada", 0x20: "BST LV", 0x21: "Cegasa LV",
+    0x22: "Meterboost", 0x23: "MOURA", 0x24: "Tecloman LV", 0x25: "Upower UE-H", 0x26: "Upower UE-I",
+    0x27: "SUNWODA LV", 0x28: "CFE LV", 0x29: "DMEGC LV", 0x2A: "JA Solar J-Pack LV", 0x2B: "HY4850",
+    0x3E: "Greenrich", 0x3F: "PYTES_LV", 0x54: "JA Solar JA-L", 0x55: "CLENERGY LV", 0x56: "Solis-Alpha LV",
+    0x61: "SolisStorage RE-L", 0x62: "Lithium LV (RS485)", 0x63: "Generic lithium LV", 0x64: "Lead acid",
+    0x65: "48V lithium", 0x66: "51.2V lithium",
 }
-BITS_FAULT6 = {
-    0: "Fail Safe", 1: "DRM controlled off-grid", 2: "CT connection abnormal", 3: "DRM not connected",
-    8: "EPM hard limit protection", 9: "AFCI board communication abnormal",
-    10: "AFCI board CT module abnormal", 11: "G100 overcurrent protection",
+HV_BATTERY = {
+    0x00: "No battery", 0x01: "Pylontech HV", 0x03: "BYD B-Box HV", 0x04: "LG HV", 0x05: "Soluna/DLG HV",
+    0x06: "Dyness HV", 0x07: "Aoboet HV", 0x08: "WECO HV", 0x09: "Alpha HV", 0x0A: "GS Energy",
+    0x0B: "BYD HVS/HVM/HVL", 0x0C: "Jinko HV", 0x0D: "FOX HV", 0x0E: "LG 16H HV", 0x0F: "PureDrive HV",
+    0x10: "UZ Energy HV", 0x13: "Fortress HV", 0x14: "AMPACE HV", 0x15: "WTS HV (BYD)", 0x16: "J-PACK HV",
+    0x17: "SUNWODA HV", 0x26: "LG Enblock S", 0x27: "JA-H HV", 0x28: "BMZ HV", 0x29: "HomeGrid HV",
+    0x2A: "Greenrich HV", 0x2B: "BAT HV", 0x2C: "Gotion HV", 0x2D: "Pylon M7 HV", 0x61: "SolisStorage RE-H",
+    0x62: "SolisStorage CI", 0x63: "Generic lithium HV",
 }
-# Appendix 3 - control word (3049): bit set = protection NOT enabled
-BITS_3049 = {
-    0: "Relay protection disabled", 1: "Leakage current protection disabled", 2: "AFCI protection disabled",
-    3: "Grounding protection disabled", 4: "Over-frequency load shedding disabled",
-    5: "Grid disturbance 02 disabled", 6: "Multi-MPPT parallel mode", 7: "Constant voltage MPPT mode",
-    8: "Grid current AD sampling protection disabled",
-}
-# Appendix 5 - initial setting state (3221)
-BITS_3221 = {
-    0: "Model set", 1: "National standard set", 2: "Power curve set", 3: "Module ID flag",
-    4: "Fan detection supported", 5: "FCAS running", 6: "AFCI self-test ended",
-    7: "AFCI self-test detected arc", 8: "DSP chip type bit8", 9: "DSP chip type bit9",
-    10: "IGBT screening complete", 14: "DSP waveform ready",
-}
-BITS_3113 = {0: "FailSafe on", 1: "MET-CT FailSafe on"}
-BITS_3147 = {0: "LVRT", 1: "US Rule21 VRT", 2: "US Rule21 FRT", 3: "Brazil LVRT", 4: "BDEW LVRT"}
-BITS_3152 = {0: "Module 1 fault", 1: "Module 2 fault", 2: "Module 3 fault", 3: "Module 4 fault", 4: "Module 5 fault"}
-BITS_3154 = {0: "Volt-watt", 1: "Volt-var", 2: "Fixed PF", 3: "Fixed reactive power", 4: "Power-PF"}
-BITS_3157 = {0: "PID on"}
-BITS_3160 = {0: "Fstart accuracy 0.001Hz"}
-BITS_3250 = {0: "Meter on load side", 1: "Meter on grid side", 2: "24H consumption monitoring"}
-BITS_3713 = {0: "Over-frequency derating", 1: "Volt-watt", 2: "Volt-var", 3: "Fixed reactive power",
-             4: "Fixed PF", 5: "Active-reactive P-Q"}
+
+CHARGE_DIR = {0: "Charging", 1: "Discharging"}
+ON_OFF_CMD = {0xBE: "On", 0xDE: "Off"}
+ENABLED = {0: "Disabled", 1: "Enabled"}
+OFF_ON = {0: "Off", 1: "On"}
+VALID_AA55 = {0xAA55: "Valid"}
+LG_DIAG = {0: "No abnormality", 1: "Warning 1 (power limited)", 2: "Warning 2 (standby)", 3: "Fault"}
+LG_MODE = {0: "Initial", 1: "Standby", 3: "Operation", 4: "Update", 5: "Fault", 6: "Self update", 10: "Power saving"}
+GEN_STATE = {1: "Stopped", 2: "Supplying power", 3: "Preheating", 4: "Cooling"}
+AMBIENT = {1: "Normal temperature", 2: "Low temperature", 3: "High temperature"}
+ITALY_FULL_TEST = {1: "Single self-test", 2: "Full self-test"}
 
 # --------------------------------------------------------------------------
 # Register map
@@ -336,13 +318,14 @@ class Reg:
     addr: int
     key: str
     name: str
-    type: str = "U16"           # U16 S16 U32 S32 HEX ENUM BITS SNHEX ASCII TIME
+    type: str = "U16"   # U16 S16 U32 S32 HEX ENUM BITS ASCII TIME BATTMODEL BMSREQ DISPATCH
     scale: float = 1
     unit: str = ""
     group: str = ""
     size: int = 0
     table: dict | None = None
     note: str = ""
+    fc: int = 4
 
     def __post_init__(self):
         if not self.size:
@@ -353,16 +336,16 @@ REGS: list[Reg] = []
 GROUPS: dict[str, str] = {}
 
 
-def group(gkey: str, title: str, rows: list[tuple]):
+def group(gkey: str, title: str, rows: list[tuple], fc: int = 4):
     GROUPS[gkey] = title
     for r in rows:
         addr, key, name, *rest = r
         kw = rest[0] if rest else {}
-        REGS.append(Reg(addr, key, name, group=gkey, **kw))
+        REGS.append(Reg(addr, key, name, group=gkey, fc=fc, **kw))
 
 
-def U(scale=1, unit="", **kw):  return dict(type="U16", scale=scale, unit=unit, **kw)
-def S(scale=1, unit="", **kw):  return dict(type="S16", scale=scale, unit=unit, **kw)
+def U(scale=1, unit="", **kw):   return dict(type="U16", scale=scale, unit=unit, **kw)
+def S(scale=1, unit="", **kw):   return dict(type="S16", scale=scale, unit=unit, **kw)
 def U32(scale=1, unit="", **kw): return dict(type="U32", scale=scale, unit=unit, **kw)
 def S32(scale=1, unit="", **kw): return dict(type="S32", scale=scale, unit=unit, **kw)
 def E(table, **kw):  return dict(type="ENUM", table=table, **kw)
@@ -372,212 +355,324 @@ def H(**kw):         return dict(type="HEX", **kw)
 
 group("info", "Device info", [
     (35000, "inverter_type", "Inverter type (35000)", E(INVERTER_TYPE)),
-    (3000, "product_model", "Product model", H()),
-    (3001, "dsp_version", "DSP software version", H(note="AA=slave DSP, BB=main DSP")),
-    (3002, "hmi_major_version", "HMI major version", H()),
-    (3021, "hmi_version", "HMI version", H(note="AA=minor, BB=major")),
-    (3108, "master_dsp_sub_version", "Main DSP minor version", H()),
-    (3003, "ac_output_type", "AC output type", E(AC_OUTPUT_TYPE)),
-    (3004, "dc_input_type", "DC input type", U(note="value+1 = number of DC inputs")),
-    (3061, "serial_number", "Serial number", dict(type="SNHEX", size=4)),
-    (3230, "serial_number_ascii", "Serial number (ASCII)", dict(type="ASCII", size=18)),
-    (3110, "rated_apparent_power", "Rated apparent power", U(10, "VA")),
-    (3054, "grid_standard", "Grid standard code", H(note="see Appendix 4")),
-    (3055, "power_curve_number", "Power curve number", U()),
-    (3107, "grid_filter_number", "Grid filter number", U()),
-    (3223, "safety_version", "Safety version", U()),
-    (3073, "system_time", "System time", dict(type="TIME", size=6)),
-    (3079, "drm_number", "DRM number", U()),
-    (3094, "installation_method", "Installation method", E(INSTALL_METHOD)),
-    (3220, "batch_upgrade_flag", "Batch upgrade support", H(note="hi=ARM, lo=DSP")),
-    (3221, "initial_setting_state", "Initial setting state", B(BITS_3221)),
+    (33000, "product_model", "Product model", H()),
+    (33004, "serial_number", "Serial number", dict(type="ASCII", size=16)),
+    (33001, "dsp_major", "DSP major version", H()),
+    (33021, "dsp_sub", "DSP sub version", H()),
+    (33002, "hmi_major", "HMI major version", H()),
+    (33069, "hmi_sub", "HMI sub version", H()),
+    (34367, "hmi_lcd_version", "HMI-LCD firmware", H(note="hi=major, lo=minor")),
+    (34240, "afci_version", "AFCI board firmware", H()),
+    (33068, "safety_version", "Safety regulation version", U()),
+    (33092, "grid_standard", "National standard code", H(note="see Appendix 2 (M33092)")),
+    (33067, "rated_apparent_power", "Rated apparent power", U(10, "VA")),
+    (33042, "rated_ac_current", "Rated AC grid port current", U(0.1, "A")),
+    (33041, "battery_max_current", "Battery max charge/discharge current", U(0.1, "A")),
+    (33048, "dc_input_type", "DC input type", U(note="value+1 = number of PV inputs")),
 ])
 
-group("energy", "Energy", [
-    (3009, "total_energy", "Total energy", U32(1, "kWh")),
-    (3117, "total_energy_decimal", "Total energy decimal part", U(0.001, "kWh")),
-    (3015, "energy_today", "Energy today", U(0.1, "kWh")),
-    (3159, "dc_energy_today", "DC energy today", U(0.1, "kWh")),
-    (3011, "energy_this_month", "Energy this month", U32(1, "kWh")),
-    (3013, "energy_last_month", "Energy last month", U32(1, "kWh")),
-    (3017, "energy_this_year", "Energy this year", U32(1, "kWh")),
-    (3019, "energy_last_year", "Energy last year", U32(1, "kWh")),
+group("status", "Status & alarms", [
+    (33095, "inverter_status", "Inverter status", H()),
+    (33070, "alarm_code", "Alarm sub-code", H()),
+    (33121, "operating_status", "Operating status bits", B(BITS_33121)),
+    (33339, "inverter_warning", "Inverter warning bits", B(BITS_33339)),
+    (33098, "drm_status", "DRM status", U()),
+    (33123, "std_mode_status", "Standard mode startup bits", B(BITS_33123)),
+    (33093, "inverter_temperature", "Inverter module temperature (IGBT)", S(0.1, "C")),
 ])
 
-group("dc", "DC / PV input", [
-    (3007, "total_dc_power", "Total DC input power", U32(1, "W")),
-    (3022, "dc_voltage_1", "DC voltage 1", U(0.1, "V")),
-    (3023, "dc_current_1", "DC current 1", U(0.1, "A")),
-    (3024, "dc_voltage_2", "DC voltage 2", U(0.1, "V")),
-    (3025, "dc_current_2", "DC current 2", U(0.1, "A")),
-    (3026, "dc_voltage_3", "DC voltage 3", U(0.1, "V")),
-    (3027, "dc_current_3", "DC current 3", U(0.1, "A")),
-    (3028, "dc_voltage_4", "DC voltage 4", U(0.1, "V")),
-    (3029, "dc_current_4", "DC current 4", U(0.1, "A")),
-    (3031, "initial_ground_voltage", "Initial ground voltage", U(0.1, "V")),
-    (3032, "dc_bus_voltage", "DC bus voltage", U(0.1, "V")),
-    (3033, "dc_half_bus_voltage", "DC half-bus voltage", U(0.1, "V")),
-    (3092, "pv_insulation_resistance", "PV insulation resistance", U(1, "kOhm")),
-    (3087, "insulation_protection_value", "Insulation resistance protection", U(1, "kOhm")),
-    (3106, "leakage_current", "Leakage current", U(1, "mA")),
-    (3086, "leakage_protection_value", "Leakage current protection", U(1, "mA")),
+group("pv", "PV", [
+    (33057, "pv_power", "Total PV input power", U32(1, "W")),
+    *[row for i, base in [(1, 33049), (2, 33051), (3, 33053), (4, 33055), (5, 33059), (6, 33061),
+                          (7, 33063), (8, 33065), (9, 34498), (10, 34500)]
+      for row in [(base, f"pv{i}_voltage", f"PV{i} voltage", U(0.1, "V")),
+                  (base + 1, f"pv{i}_current", f"PV{i} current", U(0.1, "A"))]],
+    (33035, "pv_energy_today", "PV energy today", U(0.1, "kWh")),
+    (33029, "pv_energy_total", "PV energy total", U32(1, "kWh")),
 ])
 
-group("ac", "AC output", [
-    (3005, "active_power", "Active power", S32(1, "W")),
-    (3056, "reactive_power", "Reactive power", S32(1, "var")),
-    (3058, "apparent_power", "Apparent power", S32(1, "VA")),
-    (3060, "power_factor", "Power factor", S(0.001, note="50-70K/255K only")),
-    (3109, "power_percentage", "Real-time power / rated", U(0.01, "%")),
-    (3034, "ac_voltage_a", "AB line / A phase voltage", U(0.1, "V")),
-    (3035, "ac_voltage_b", "BC line / B phase voltage", U(0.1, "V")),
-    (3036, "ac_voltage_c", "CA line / C phase voltage", U(0.1, "V")),
-    (3037, "ac_current_a", "A phase current", U(0.1, "A")),
-    (3038, "ac_current_b", "B phase current", U(0.1, "A")),
-    (3039, "ac_current_c", "C phase current", U(0.1, "A")),
-    (3043, "grid_frequency", "Grid frequency", U(0.01, "Hz")),
-    (3042, "inverter_temperature", "Inverter temperature (IGBT)", S(0.1, "C")),
-    (3093, "inverter_temperature_2", "Inverter temperature 2", S(0.1, "C")),
+group("battery", "Battery 1", [
+    (33139, "battery_soc", "State of charge", U(1, "%")),
+    (33140, "battery_soh", "State of health", U(1, "%")),
+    (33133, "battery_voltage", "Voltage", U(0.1, "V")),
+    (33134, "battery_current", "Current (magnitude)", S(0.1, "A")),
+    (33135, "battery_direction", "Direction", E(CHARGE_DIR)),
+    (33149, "battery_power", "Power (magnitude)", S32(1, "W")),
+    (33043, "battery_temperature", "Battery temperature (BMS)", S(0.1, "C")),
+    (33046, "battery_mosfet_temp", "Inverter battery MOSFET temp", S(0.1, "C")),
+    (34348, "battery_cell_v_min", "Min cell voltage", U(0.001, "V")),
+    (34349, "battery_cell_v_max", "Max cell voltage", U(0.001, "V")),
+    (34350, "battery_cell_t_min", "Min cell temperature", S(0.1, "C")),
+    (34351, "battery_cell_t_max", "Max cell temperature", S(0.1, "C")),
+    (33295, "battery_bms_requests", "BMS requests", dict(type="BMSREQ")),
+    (33163, "battery_charge_today", "Charge energy today", U(0.1, "kWh")),
+    (33167, "battery_discharge_today", "Discharge energy today", U(0.1, "kWh")),
+    (33161, "battery_charge_total", "Charge energy total", U32(1, "kWh")),
+    (33165, "battery_discharge_total", "Discharge energy total", U32(1, "kWh")),
 ])
 
-group("status", "Status & faults", [
-    (3044, "inverter_status", "Inverter status", H()),
-    (3030, "alarm_code", "Alarm sub-code", H()),
-    (3095, "limit_status", "Derating / limit status", B(BITS_3095)),
-    (3096, "fault_code_1", "Fault code 1", B(BITS_FAULT1)),
-    (3097, "fault_code_2", "Fault code 2", B(BITS_FAULT2)),
-    (3098, "fault_code_3", "Fault code 3", B(BITS_FAULT3)),
-    (3099, "fault_code_4", "Fault code 4", B(BITS_FAULT4)),
-    (3100, "fault_code_5", "Fault code 5", B(BITS_FAULT5)),
-    (3101, "fault_code_6", "Fault code 6", B(BITS_FAULT6)),
-    (3049, "control_word", "Inverter control word", B(BITS_3049)),
-    (3119, "g100_status", "G100 running status", E(G100_STATE)),
-    (3225, "igbt_selfcheck", "IGBT self-check", E(IGBT_SELFCHECK)),
-    (3228, "one_click_reset_enable", "One-click reset enable", E(RESET_ENABLE)),
-    (3229, "one_click_reset_command", "One-click reset command", E(RESET_CMD)),
+group("grid", "AC grid port (inverter)", [
+    (33151, "grid_port_power", "Grid port total active power", S32(1, "W", note="+ out of inverter, - into inverter")),
+    (33079, "active_power", "Inverter active power", S32(1, "W")),
+    (33081, "reactive_power", "Inverter reactive power", S32(1, "var")),
+    (33083, "apparent_power", "Inverter apparent power", S32(1, "VA")),
+    (33073, "ac_voltage_a", "AB line / A phase voltage", U(0.1, "V")),
+    (33074, "ac_voltage_b", "BC line / B phase voltage", U(0.1, "V")),
+    (33075, "ac_voltage_c", "CA line / C phase voltage", U(0.1, "V")),
+    (33076, "ac_current_a", "A phase current", U(0.1, "A")),
+    (33077, "ac_current_b", "B phase current", U(0.1, "A")),
+    (33078, "ac_current_c", "C phase current", U(0.1, "A")),
+    (33094, "grid_frequency", "Grid frequency", U(0.01, "Hz")),
+    (33512, "grid_port_p_a", "Phase A active power", S(10, "W")),
+    (33513, "grid_port_q_a", "Phase A reactive power", S(10, "var")),
+    (33514, "grid_port_s_a", "Phase A apparent power", S(10, "VA")),
+    (33515, "grid_port_p_b", "Phase B active power", S(10, "W")),
+    (33516, "grid_port_q_b", "Phase B reactive power", S(10, "var")),
+    (33517, "grid_port_s_b", "Phase B apparent power", S(10, "VA")),
+    (33518, "grid_port_p_c", "Phase C active power", S(10, "W")),
+    (33519, "grid_port_q_c", "Phase C reactive power", S(10, "var")),
+    (33520, "grid_port_s_c", "Phase C apparent power", S(10, "VA")),
 ])
 
-group("control", "Power control", [
-    (3041, "working_mode", "Standard working mode", E(WORKING_MODE)),
-    (3154, "working_mode_status", "Working mode running bits", B(BITS_3154)),
-    (3090, "power_limit_switch", "Power limit switch", E(POWER_LIMIT_SWITCH)),
-    (3050, "active_power_limit", "Active power limit", U(0.01, "%")),
-    (3045, "active_power_limit_output", "Limited active power output", S32(1, "W")),
-    (3091, "reactive_power_switch", "Reactive power switch", E(REACTIVE_SWITCH)),
-    # Unit column says 0.01 but the remark says "set 1, write 1000" - 0.001 matches the example
-    (3051, "pf_adjust_value", "Power factor adjust value", S(0.001)),
-    (3052, "pf_adjust_actual", "Actual power factor adjustment", S(0.001)),
-    (3053, "reactive_power_percent", "Reactive power setting", S(0.01, "%")),
-    (3047, "reactive_power_limit_output", "Limited reactive power output", S32(1, "var")),
-    (3158, "voltvar_vref", "Volt-Var Vref", U(0.1, "V")),
-    (3155, "standard_select_status", "Power-on standard selection", E(STD_SELECT)),
-    (3160, "accuracy_flag", "Accuracy flag", B(BITS_3160)),
-    (3161, "meter_or_dual485", "Meter / dual 485 switch", E(METER_485)),
-    (3147, "vrt_enable_bits", "Voltage ride-through enable", B(BITS_3147)),
-    (3148, "vrt_enable_flag", "Voltage ride-through flag", E(VRT_FLAG)),
+group("backup", "Backup port (EPS)", [
+    (33148, "backup_power_lo", "Backup load power (low)", U()),
+    (34344, "backup_power_hi", "Backup load power (high)", U()),
+    (33137, "backup_voltage_a", "Backup voltage A", U(0.1, "V")),
+    (33138, "backup_current_a", "Backup current A", U(0.1, "A")),
+    (33153, "backup_voltage_b", "Backup voltage B", U(0.1, "V")),
+    (33154, "backup_current_b", "Backup current B", U(0.1, "A")),
+    (33155, "backup_voltage_c", "Backup voltage C", U(0.1, "V")),
+    (33156, "backup_current_c", "Backup current C", U(0.1, "A")),
+    (33521, "backup_p_a", "Phase A active power", S(10, "W")),
+    (33522, "backup_q_a", "Phase A reactive power", S(10, "var")),
+    (33523, "backup_s_a", "Phase A apparent power", S(10, "VA")),
+    (33524, "backup_p_b", "Phase B active power", S(10, "W")),
+    (33525, "backup_q_b", "Phase B reactive power", S(10, "var")),
+    (33526, "backup_s_b", "Phase B apparent power", S(10, "VA")),
+    (33527, "backup_p_c", "Phase C active power", S(10, "W")),
+    (33528, "backup_q_c", "Phase C reactive power", S(10, "var")),
+    (33529, "backup_s_c", "Phase C apparent power", S(10, "VA")),
+    (33596, "backup_energy_today", "Backup load energy today", U(0.1, "kWh")),
+    (33590, "backup_energy_total", "Backup load energy total", U32(1, "kWh")),
 ])
 
-group("epm", "Internal EPM (export power manager)", [
-    (3111, "epm_switch", "EPM soft switch", U(note="meaning depends on model, see PDF p.9")),
-    (3112, "epm_backflow_limit", "EPM backflow power limit", S(100, "W")),
-    (3113, "epm_failsafe", "EPM failsafe", B(BITS_3113)),
-    (3114, "epm_realtime_backflow", "EPM real-time backflow power", U(10, "W")),
-    (3115, "epm_hard_switch", "EPM hard switch", E(EPM_HARD_SWITCH)),
-    (3116, "epm_hard_limit", "EPM hard limit", S(100, "W")),
-    (3118, "ct_link_test", "CT link test", E(CT_LINK)),
-    (3157, "external_pid_status", "External PID status", B(BITS_3157)),
+group("load", "Household load", [
+    (33147, "grid_load_power_lo", "Grid load power (low)", U()),
+    (34343, "grid_load_power_hi", "Grid load power (high)", U()),
+    (34424, "grid_load_p_a", "Grid load phase A power", U(10, "W")),
+    (34425, "grid_load_p_b", "Grid load phase B power", U(10, "W")),
+    (34426, "grid_load_p_c", "Grid load phase C power", U(10, "W")),
+    (33179, "load_energy_today", "Total load energy today (grid+backup)", U(0.1, "kWh")),
+    (33177, "load_energy_total", "Total load energy (grid+backup)", U32(1, "kWh")),
+    (33586, "grid_load_energy_today", "Grid load energy today", U(0.1, "kWh")),
+    (33580, "grid_load_energy_total", "Grid load energy total", U32(1, "kWh")),
 ])
 
-group("meter", "Meter", [
-    (3250, "meter_placement", "Meter placement", B(BITS_3250)),
-    (3248, "household_load_energy", "Household load consumption", S32(0.01, "kWh")),
-    (3251, "meter_voltage_a", "Meter voltage A", U(0.1, "V")),
-    (3252, "meter_current_a", "Meter current A", U(0.01, "A")),
-    (3253, "meter_voltage_b", "Meter voltage B", U(0.1, "V")),
-    (3254, "meter_current_b", "Meter current B", U(0.01, "A")),
-    (3255, "meter_voltage_c", "Meter voltage C", U(0.1, "V")),
-    (3256, "meter_current_c", "Meter current C", U(0.01, "A")),
-    (3257, "meter_active_power_a", "Meter active power A", S32(0.001, "kW")),
-    (3259, "meter_active_power_b", "Meter active power B", S32(0.001, "kW")),
-    (3261, "meter_active_power_c", "Meter active power C", S32(0.001, "kW")),
-    (3263, "meter_active_power", "Meter total active power", S32(0.001, "kW", note="+ export, - import")),
-    (3265, "meter_reactive_power_a", "Meter reactive power A", S32(1, "var")),
-    (3267, "meter_reactive_power_b", "Meter reactive power B", S32(1, "var")),
-    (3269, "meter_reactive_power_c", "Meter reactive power C", S32(1, "var")),
-    (3271, "meter_reactive_power", "Meter total reactive power", S32(1, "var")),
-    (3273, "meter_apparent_power_a", "Meter apparent power A", S32(1, "VA")),
-    (3275, "meter_apparent_power_b", "Meter apparent power B", S32(1, "VA")),
-    (3277, "meter_apparent_power_c", "Meter apparent power C", S32(1, "VA")),
-    (3279, "meter_apparent_power", "Meter total apparent power", S32(1, "VA")),
-    (3281, "meter_power_factor", "Meter power factor", S(0.001)),
-    (3282, "meter_frequency", "Meter grid frequency", U(0.01, "Hz")),
-    (3283, "meter_total_active_energy", "Meter grid total active energy", U32(0.01, "kWh")),
-    (3285, "meter_transmission_energy", "Meter grid transmission total energy", U32(0.01, "kWh")),
+group("energy", "Grid energy", [
+    (33171, "grid_import_today", "Imported from grid today", U(0.1, "kWh")),
+    (33175, "grid_export_today", "Exported to grid today", U(0.1, "kWh")),
+    (33169, "grid_import_total", "Imported from grid total", U32(1, "kWh")),
+    (33173, "grid_export_total", "Exported to grid total", U32(1, "kWh")),
+    (33577, "port_export_today", "Inverter AC port export today", U(0.1, "kWh")),
+    (33578, "port_import_today", "Inverter AC port import today", U(0.1, "kWh")),
+    (33186, "port_export_total", "Inverter AC port export total", U32(1, "kWh")),
+    (33188, "port_import_total", "Inverter AC port import total", U32(1, "kWh")),
 ])
 
-group("strings", "PV strings (models with >= 4 DC inputs)", [
-    (3287, "pv_combination", "PV voltage/current combination", E(PV_COMBO)),
-    (3299, "pv_total_voltage", "Total PV voltage", U(0.1, "V")),
-    (3300, "pv_total_current", "Total PV current", S(0.1, "A")),
-    *[(3300 + i, f"pv{i}_current", f"PV{i} current", S(0.1, "A")) for i in range(1, 21)],
-    *[(3288 + i - 20, f"pv{i}_current", f"PV{i} current", S(0.1, "A")) for i in range(21, 31)],
-    (3337, "pv31_current", "PV31 current", U(0.1, "A")),
-    (3338, "pv32_current", "PV32 current", U(0.1, "A")),
-    *[(3320 + i, f"pv_string{i}_voltage", f"PV string {i} voltage", U(0.1, "V")) for i in range(1, 17)],
+group("meter", "Meter / CT", [
+    (33263, "meter_active_power", "Meter total active power", S32(1, "W", note="+ export, - import")),
+    (33257, "meter_active_power_a", "Meter active power A", S32(1, "W")),
+    (33259, "meter_active_power_b", "Meter active power B", S32(1, "W")),
+    (33261, "meter_active_power_c", "Meter active power C", S32(1, "W")),
+    (33251, "meter_voltage_a", "Meter voltage A", U(0.1, "V")),
+    (33252, "meter_current_a", "Meter current A", U(0.01, "A")),
+    (33253, "meter_voltage_b", "Meter voltage B", U(0.1, "V")),
+    (33254, "meter_current_b", "Meter current B", U(0.01, "A")),
+    (33255, "meter_voltage_c", "Meter voltage C", U(0.1, "V")),
+    (33256, "meter_current_c", "Meter current C", U(0.01, "A")),
+    (33271, "meter_reactive_power", "Meter total reactive power", S32(1, "var")),
+    (33265, "meter_reactive_power_a", "Meter reactive power A", S32(1, "var")),
+    (33267, "meter_reactive_power_b", "Meter reactive power B", S32(1, "var")),
+    (33269, "meter_reactive_power_c", "Meter reactive power C", S32(1, "var")),
+    (33279, "meter_apparent_power", "Meter total apparent power", S32(1, "VA")),
+    (33273, "meter_apparent_power_a", "Meter apparent power A", S32(1, "VA")),
+    (33275, "meter_apparent_power_b", "Meter apparent power B", S32(1, "VA")),
+    (33277, "meter_apparent_power_c", "Meter apparent power C", S32(1, "VA")),
+    (33281, "meter_power_factor", "Meter power factor", S(0.01)),
+    (33282, "meter_frequency", "Meter frequency", U(0.01, "Hz")),
+    (33283, "meter_import_energy", "Meter energy imported", U32(0.01, "kWh")),
+    (33285, "meter_export_energy", "Meter energy exported", U32(0.01, "kWh")),
+    (33314, "meter2_active_power", "Meter 2 total active power", S32(1, "W")),
 ])
 
-group("mppt", "MPPT (models with >= 8 DC inputs)", [
-    *[(3499 + i, f"mppt{i}_voltage", f"MPPT {i} voltage", U(0.1, "V")) for i in range(1, 16)],
-    *[(3529 + i, f"mppt{i}_current", f"MPPT {i} current", S(0.1, "A")) for i in range(1, 16)],
-    (3545, "mppt16_voltage", "MPPT 16 voltage", S(0.1, "V")),
-    (3546, "mppt16_current", "MPPT 16 current", S(0.1, "A")),
+group("settings", "Battery & mode settings (FC03)", [
+    (43000, "rtc", "Inverter clock", dict(type="TIME", size=6)),
+    (43006, "slave_address", "Slave address", U()),
+    (43007, "power_on_off", "Power on/off", E(ON_OFF_CMD)),
+    (43009, "battery_model", "Battery model", dict(type="BATTMODEL")),
+    (43110, "storage_control", "Energy storage control switch", B(BITS_43110)),
+    (43010, "max_charge_soc", "Max charging SOC", U(1, "%")),
+    (43011, "over_discharge_soc", "Over-discharge SOC", U(1, "%")),
+    (43018, "force_charge_soc", "Forced charge SOC", U(1, "%")),
+    (43024, "reserve_soc", "Battery reserved SOC (backup)", U(1, "%")),
+    (43117, "max_charge_current", "Battery 1 max charge current", U(0.1, "A")),
+    (43118, "max_discharge_current", "Battery 1 max discharge current", U(0.1, "A")),
+    (43019, "rated_capacity", "Rated capacity (lead-acid / non-comm)", U(1, "Ah")),
+    (43020, "over_discharge_voltage", "Over-discharge voltage", U(0.1, "V")),
+    (43021, "force_charge_voltage", "Forced charge voltage", U(0.1, "V")),
+    (43022, "temp_comp", "Lead-acid temp compensation", U(1, "mV/C")),
+    (43023, "ambient_status", "Lead-acid ambient selection", E(AMBIENT)),
+    (43111, "backup_enabled", "Backup load function", E(ENABLED)),
+    (43112, "backup_voltage_set", "Backup output voltage", U(0.1, "V")),
+], fc=3)
+
+group("battery2", "Battery 2 (dual-battery models)", [
+    (34278, "bms2_soc", "State of charge", U(1, "%")),
+    (34279, "bms2_soh", "State of health", U(1, "%")),
+    (34289, "battery2_voltage", "Voltage", U(0.1, "V")),
+    (34290, "battery2_current", "Current (magnitude)", S(0.1, "A")),
+    (34291, "battery2_direction", "Direction", E(CHARGE_DIR)),
+    (34368, "battery2_power", "Power (magnitude)", S32(1, "W")),
+    (34277, "bms2_temperature", "Temperature", S(0.1, "C")),
+    (34280, "bms2_charge_v_limit", "Charge voltage limit", U(0.1, "V")),
+    (34371, "bms2_discharge_v_limit", "Discharge voltage limit", U(0.1, "V")),
+    (34281, "bms2_charge_i_limit", "Charge current limit", U(0.1, "A")),
+    (34282, "bms2_discharge_i_limit", "Discharge current limit", U(0.1, "A")),
+    (34373, "bms2_cell_v_min", "Min cell voltage", U(0.001, "V")),
+    (34374, "bms2_cell_v_max", "Max cell voltage", U(0.001, "V")),
+    (34375, "bms2_cell_t_min", "Min cell temperature", U(0.1, "C")),
+    (34376, "bms2_cell_t_max", "Max cell temperature", U(0.1, "C")),
+    (34578, "bms2_requests", "BMS requests", dict(type="BMSREQ")),
 ])
 
-group("temps", "Module temperatures (250K series)", [
-    (3570, "ntc_phase_a", "A phase module NTC", U(0.1, "C")),
-    (3571, "ntc_phase_b", "B phase module NTC", U(0.1, "C")),
-    (3572, "ntc_phase_c", "C phase module NTC", U(0.1, "C")),
-    *[(3572 + i, f"dc_ntc{i}", f"DC NTC{i}", U(0.1, "C")) for i in range(1, 9)],
+
+def _lg_rows(base: int, who: str) -> list[tuple]:
+    k = who.lower()
+    return [
+        (base + 0, f"lg_{k}_soc", f"{who} SOC", U(0.1, "%")),
+        (base + 1, f"lg_{k}_soh", f"{who} SOH", U(0.1, "%")),
+        (base + 2, f"lg_{k}_voltage", f"{who} voltage", U(0.1, "V")),
+        (base + 3, f"lg_{k}_current", f"{who} current (+chg)", S(0.1, "A")),
+        (base + 4, f"lg_{k}_max_charge_p", f"{who} max charge power", U(1, "W")),
+        (base + 5, f"lg_{k}_max_discharge_p", f"{who} max discharge power", U(1, "W")),
+        (base + 6, f"lg_{k}_dcdc_fw_main", f"{who} DCDC firmware (main)", H()),
+        (base + 7, f"lg_{k}_dcdc_fw_test", f"{who} DCDC firmware (test)", H()),
+        (base + 8, f"lg_{k}_bms_fw_hi", f"{who} BMS firmware high", H()),
+        (base + 9, f"lg_{k}_bms_fw_lo", f"{who} BMS firmware low", H()),
+        (base + 10, f"lg_{k}_fault_id", f"{who} fault ID", H()),
+        (base + 11, f"lg_{k}_diagnostic", f"{who} diagnostic", E(LG_DIAG)),
+        (base + 12, f"lg_{k}_mode", f"{who} status/mode", E(LG_MODE)),
+        (base + 13, f"lg_{k}_power", f"{who} power (+chg)", S(1, "W")),
+        (base + 14, f"lg_{k}_max_temp", f"{who} max temperature", S(0.1, "C")),
+        (base + 15, f"lg_{k}_flags", f"{who} status flags", B(BITS_LG)),
+    ]
+
+
+group("lg", "LG RESU 10H/16H battery", [*_lg_rows(34200, "Master"), *_lg_rows(34216, "Secondary")])
+
+group("smart", "Smart port / generator / AC coupling", [
+    (34328, "smart_voltage_a", "Smart port voltage A", U(0.1, "V")),
+    (34329, "smart_voltage_b", "Smart port voltage B", U(0.1, "V")),
+    (34330, "smart_voltage_c", "Smart port voltage C", U(0.1, "V")),
+    (34331, "smart_current_a", "Smart port current A", U(0.1, "A")),
+    (34332, "smart_current_b", "Smart port current B", U(0.1, "A")),
+    (34333, "smart_current_c", "Smart port current C", U(0.1, "A")),
+    (34391, "smart_power_a", "Smart port active power A", S(10, "W")),
+    (34392, "smart_power_b", "Smart port active power B", S(10, "W")),
+    (34393, "smart_power_c", "Smart port active power C", S(10, "W")),
+    (34411, "smart_load_energy_total", "Smart load energy total", U32(1, "kWh")),
+    (34413, "smart_load_energy_today", "Smart load energy today", U32(1, "kWh")),
+    (33530, "gen_power_a", "Generator active power A", S(10, "W")),
+    (33534, "gen_power_b", "Generator active power B", S(10, "W")),
+    (33535, "gen_power_c", "Generator active power C", S(10, "W")),
+    (34410, "gen_frequency", "Generator frequency", U(0.01, "Hz")),
+    (34590, "gen_state", "Generator state", E(GEN_STATE)),
+    (33531, "gen_energy_today", "Generator energy today", U(0.1, "kWh")),
+    (33532, "gen_energy_total", "Generator energy total", U32(1, "kWh")),
+    (34451, "ac_couple_energy_today", "AC coupling energy today", U(0.1, "kWh")),
+    (34445, "ac_couple_energy_total", "AC coupling energy total", U32(1, "kWh")),
+    (33245, "parallel_inverter_power", "AC-coupled PV inverter power", U(0.1, "kW")),
+    (33246, "parallel_inverter_ct", "AC-coupled PV inverter CT switch", E(OFF_ON)),
 ])
 
-group("afci", "AFCI (arc fault)", [
-    (3149, "afci_board_model", "AFCI board model", E(AFCI_BOARD)),
-    (3150, "afci_board_version", "AFCI board version", H()),
-    (3151, "afci_fault_data_ready", "AFCI fault data obtained", E(NO_YES)),
-    (3152, "afci_ct_module_faults", "AFCI CT module faults", B(BITS_3152)),
-    (3153, "afci_arc_fault_string", "AFCI arc fault string", U(note="1-30 string, 31-35 module")),
-    (3120, "arc_fault_count", "Arc fault occurrences", U()),
-    (3224, "afci_selfcheck_done", "AFCI self-check completed", U()),
+group("ports", "Port power summary (module 1)", [
+    (34600, "module1_id", "Module ID", H()),
+    (34601, "module1_count", "Register count", U()),
+    (34602, "module1_valid", "Valid flag", E(VALID_AA55)),
+    (34603, "port_pv_power", "PV power", S32(1, "W")),
+    (34605, "port_battery1_power", "Battery 1 power (+chg)", S32(1, "W")),
+    (34607, "port_battery2_power", "Battery 2 power (+chg)", S32(1, "W")),
+    (34609, "port_inverter_power", "Inverting bridge active power", S32(1, "W")),
+    (34611, "port_backup_power", "Backup load active power", S32(1, "W")),
+    (34613, "port_backup_apparent", "Backup load apparent power", S32(1, "VA")),
+    (34615, "port_grid_port_power", "AC grid port active power", S32(1, "W")),
+    (34617, "port_generator_power", "Generator active power", S32(1, "W")),
+    (34619, "port_smart_load_power", "Smart load active power", S32(1, "W")),
+    (34621, "port_gridtie_inv_power", "Grid-tied inverter output", S32(1, "W")),
+    (34623, "port_grid_load_power", "Grid load active power", S32(1, "W")),
+    (34625, "port_public_grid_power", "Public grid active power (+export)", S32(1, "W")),
 ])
 
-group("dispatch", "Plant dispatch / adjustable capacity", [
-    (3601, "pv_adjustable", "Adjustable now", E(NO_YES)),
-    (3602, "p_adjust_up", "Active power adjustable up", S32(1, "W")),
-    (3604, "p_adjust_down", "Active power adjustable down", S32(1, "W")),
-    (3606, "q_cap_adjust_up", "Capacitive Q adjustable up", S32(1, "var")),
-    (3608, "q_cap_adjust_down", "Capacitive Q adjustable down", S32(1, "var")),
-    (3610, "q_ind_adjust_up", "Inductive Q adjustable up", S32(1, "var")),
-    (3612, "q_ind_adjust_down", "Inductive Q adjustable down", S32(1, "var")),
-    (3614, "v_upper_at_max_q", "Voltage upper limit at max Q", U(0.1, "V")),
-    (3615, "v_lower_at_max_q", "Voltage lower limit at max Q", U(0.1, "V")),
-    (3616, "pv_total_p_control", "Total active power control", E(OFF_ON)),
-    (3617, "pv_total_q_control", "Total reactive power control", E(OFF_ON)),
-    (3618, "pv_total_v_control", "Total voltage control", E(OFF_ON)),
-    (3619, "init_completed", "Initialization completed", E(NO_YES)),
-    (3620, "p_control_status", "Active power control", E(OFF_ON)),
-    (3621, "q_control_status", "Reactive power control", E(OFF_ON)),
-    (3622, "v_control_status", "Voltage control", E(OFF_ON)),
-    (3623, "full_generation", "Fully generating", E(NO_YES)),
-    (3624, "night_q_capable", "Night reactive power capable", E(NO_YES)),
-    (3625, "p_control_done", "Active power control completed", E(NO_YES)),
-    (3626, "q_control_done", "Reactive power control completed", E(NO_YES)),
-    (3627, "v_control_done", "Voltage adjustment completed", E(NO_YES)),
-    (3628, "remote_controllable", "Remotely controllable", E(NO_YES)),
-    (3629, "dc_switch", "DC switch position", E(OFF_ON)),
-    (3630, "ac_switch", "AC switch position", E(OFF_ON)),
-    (3631, "emergency_shutdown", "Emergency shutdown", E({0: "Disabled", 1: "Enabled"})),
-    (3632, "starting", "Starting", E({0: "Startup completed", 1: "Startup in progress"})),
-    (3633, "alarm_running", "Alarm", E({0: "No alarm", 1: "Alarm running"})),
+group("parallel", "Parallel system", [
+    (33388, "parallel_online", "Inverters online", B(BITS_ONLINE)),
+    (34427, "parallel_valid", "Parallel data valid", E(VALID_AA55)),
+    (34428, "par_pv_power", "Total PV power", S(100, "W")),
+    (34429, "par_gen_power", "Total generator power", S(100, "W")),
+    (34430, "par_battery_power", "Total battery power (+chg)", S(100, "W")),
+    (34431, "par_backup_power", "Total backup load power", S(100, "W")),
+    (34432, "par_inverter_power", "Total inverter power (+export)", S(100, "W")),
+    (34433, "par_smart_power", "Total smart load power", S(100, "W")),
+    (34434, "par_ac_couple_power", "Total AC couple power", S(100, "W")),
+    (34490, "par_grid_load_power", "Total grid load power", S(100, "W")),
+    (34491, "par_public_grid_power", "Public grid power (+export)", S(100, "W")),
+    (34537, "par_grid_port_power", "Total AC grid port power", S(100, "W")),
+    (34779, "par_pv_power_w", "PV power", S32(1, "W")),
+    (34781, "par_battery_power_w", "Battery power (+chg)", S32(1, "W")),
+    (34785, "par_grid_port_power_w", "AC grid port power", S32(1, "W")),
+    (34795, "par_pcc_power", "PCC active power", S32(1, "W")),
+    (34797, "par_max_soc", "Max battery SOC", U(1, "%")),
+    (34798, "par_min_soc", "Min battery SOC", U(1, "%")),
+])
+
+group("system", "PV + storage system (module 6, C&I)", [
+    (34900, "module6_id", "Module ID", H()),
+    (34901, "module6_count", "Register count", U()),
+    (34902, "module6_valid", "Valid flag", E(VALID_AA55)),
+    (34903, "sys_pv_power", "Hybrid inverters PV power", S32(1, "W")),
+    (34905, "sys_battery_power", "Hybrid inverters battery power (+chg)", S32(1, "W")),
+    (34907, "sys_inverter_power", "Hybrid inverters active power", S32(1, "W")),
+    (34909, "sys_backup_power", "System backup load power", S32(1, "W")),
+    (34911, "sys_grid_port_power", "Hybrid inverters AC grid port power", S32(1, "W")),
+    (34913, "sys_generator_power", "Generator power", S32(1, "W")),
+    (34915, "sys_smart_load_power", "Smart load power", S32(1, "W")),
+    (34917, "sys_gridtie_power", "Grid-tied inverters power", S32(1, "W")),
+    (34919, "sys_grid_load_power", "System grid load power", S32(1, "W")),
+    (34921, "sys_public_grid_power", "Public grid power (+export)", S32(1, "W")),
+    (34923, "sys_gridtie_online", "Grid-tied inverters online", U()),
+])
+
+group("remote", "Remote dispatch / FCAS", [
+    (33289, "optimal_revenue_v2", "Optimal revenue V2", E(VALID_AA55)),
+    (34502, "dispatch_valid", "Remote dispatch available", E(VALID_AA55)),
+    (34503, "dispatch_version", "Remote dispatch version", H()),
+    (34504, "dispatch_status", "Remote dispatch status", dict(type="DISPATCH")),
+    (34799, "remote_protocol_version", "Remote control protocol version", H()),
+    (34753, "local_pv_power", "Local PV power", S32(1, "W")),
+    (34755, "local_battery_power", "Local battery power (+chg)", S32(1, "W")),
+    (34765, "local_grid_port_power", "Local AC grid port power", S32(1, "W")),
+    (25000, "module7_id", "Module ID", H()),
+    (25001, "module7_count", "Register count", U()),
+    (25002, "module7_valid", "Valid flag", E(VALID_AA55)),
+    (25003, "remote_status", "Remote control status", B(BITS_25003)),
+    (25004, "avail_charge_p", "Battery available charge power", U32(1, "W")),
+    (25006, "avail_discharge_p", "Battery available discharge power", U32(1, "W")),
+    (25008, "avail_import_p", "AC port available import power", U32(1, "W")),
+    (25010, "avail_export_p", "AC port available export power", U32(1, "W")),
+    (25012, "par_avail_charge_p", "Parallel available charge power", U32(1, "W")),
+    (25014, "par_avail_discharge_p", "Parallel available discharge power", U32(1, "W")),
+    (25016, "par_avail_import_p", "Parallel available import power", U32(1, "W")),
+    (25018, "par_avail_export_p", "Parallel available export power", U32(1, "W")),
+    (25020, "par_online_ids", "Parallel inverters online", dict(type="U32")),
 ])
 
 _ITALY = [("59.S1", "V"), ("59.S2", "V"), ("27.S1", "V"), ("27.S2", "V"),
@@ -599,52 +694,18 @@ def _italy_rows(base: int, phase: str) -> list[tuple]:
 
 
 group("italy", "Italy CEI 0-21 self-test", [
-    (3121, "italy_single_selftest", "Single self-test item", U()),
-    (3122, "italy_full_selftest", "Full self-test", E(ITALY_FULL_TEST)),
-    *_italy_rows(3123, ""),
-    *_italy_rows(3650, "B"),
-    *_italy_rows(3670, "C"),
+    (33221, "italy_single_selftest", "Single self-test item", U()),
+    (33222, "italy_full_selftest", "Full self-test", E(ITALY_FULL_TEST)),
+    *_italy_rows(33223, ""),
+    *_italy_rows(33470, "B"),
+    *_italy_rows(33490, "C"),
 ])
 
-group("us", "Rated data / US grid code", [
-    (3700, "rated_active_power", "Rated active power", U32(1, "W")),
-    (3702, "p_at_pf_lead_08", "Active power at PF +0.8", U32(1, "W")),
-    (3704, "leading_pf", "Leading power factor", U(0.01)),
-    (3705, "p_at_pf_lag_08", "Active power at PF -0.8", U32(1, "W")),
-    (3707, "lagging_pf", "Lagging power factor", U(0.01)),
-    (3708, "perf_category_normal", "Normal performance category", E(PERF_NORMAL)),
-    (3709, "perf_category_abnormal", "Abnormal performance category", E(PERF_ABNORMAL)),
-    (3710, "ac_rated_voltage", "AC rated voltage", U(1, "V")),
-    (3711, "ac_ov1_limit", "AC level 1 overvoltage limit", U(0.1, "V")),
-    (3712, "ac_uv1_limit", "AC level 1 undervoltage limit", U(0.1, "V")),
-    (3713, "control_mode", "Control mode", B(BITS_3713)),
-    (3714, "admittance", "Admittance parameter (raw)", U()),
-    (3715, "manufacturer", "Manufacturer", E(MANUFACTURER)),
-    (3716, "hw_version_mainboard", "Mainboard hardware version", H()),
-    (3717, "rt_reactive_power", "Real-time reactive power", U32(1, "var")),
-    (3719, "q_cap_max", "Capacitive max reactive power", U32(1, "var")),
-    (3721, "q_ind_max", "Inductive max reactive power", U32(1, "var")),
-    (3733, "iv_curve_type", "IV curve type", E(IV_TYPE)),
-    (3734, "iv_scan_flag", "IV scan state", E(IV_SCAN)),
-    (3735, "iv_string_number", "IV curve string number", U()),
-])
-
-group("calib", "Multi-DSP (80-110K MAX/PRO)", [
-    *[(3142 + i, f"dsp{i}_version", f"DSP{i} version", H()) for i in range(1, 5)],
-    *[(3204 + 3 * (d - 1) + p, f"dsp{d}_voltage_{'abc'[p]}", f"DSP{d} {'ABC'[p]} phase voltage", U(0.1, "V"))
-      for d in range(1, 5) for p in range(3)],
-])
-
-DEFAULT_GROUPS = ["info", "energy", "dc", "ac", "status", "control", "epm", "meter",
-                  "strings", "mppt", "temps", "afci", "dispatch", "italy", "us", "calib"]
+DEFAULT_GROUPS = ["info", "status", "pv", "battery", "grid", "backup", "load", "energy", "meter", "settings"]
+ALL_GROUPS = list(GROUPS)
 
 _keys = [r.key for r in REGS]
 assert len(_keys) == len(set(_keys)), "duplicate register keys"
-
-
-def wire_address(doc_addr: int) -> int:
-    # Section 5.1 (35000) uses the address as-is; 5.2 (3000-3999) needs address - 1
-    return doc_addr if doc_addr >= 30000 else doc_addr - 1
 
 
 # --------------------------------------------------------------------------
@@ -653,6 +714,7 @@ def wire_address(doc_addr: int) -> int:
 
 @dataclass
 class Span:
+    fc: int
     start: int
     count: int
     regs: list[Reg] = field(default_factory=list)
@@ -660,29 +722,33 @@ class Span:
 
 def build_spans(regs: list[Reg], max_gap: int = 10) -> list[Span]:
     spans: list[Span] = []
-    for r in sorted(regs, key=lambda x: x.addr):
+    for r in sorted(regs, key=lambda x: (x.fc, x.addr)):
         end = r.addr + r.size
         cur = spans[-1] if spans else None
-        if (cur and r.addr - (cur.start + cur.count) <= max_gap
-                and end - cur.start <= MAX_REGS_PER_READ
-                and (r.addr >= 30000) == (cur.start >= 30000)):
+        if (cur and cur.fc == r.fc
+                and r.addr - (cur.start + cur.count) <= max_gap
+                and end - cur.start <= MAX_REGS_PER_READ):
             cur.count = max(cur.count, end - cur.start)
             cur.regs.append(r)
         else:
-            spans.append(Span(r.addr, r.size, [r]))
+            spans.append(Span(r.fc, r.addr, r.size, [r]))
     return spans
 
 
 def read_regs(client: RtuClient, regs: list[Reg], log: Callable[[str], None]) -> tuple[dict[int, list[int]], dict[int, str]]:
-    """Returns ({addr: [words]}, {addr: error}) per register definition."""
+    """Returns ({id(reg): [words]}, {id(reg): error})."""
     raw: dict[int, list[int]] = {}
     errors: dict[int, str] = {}
+    state = {"ok": False, "timeouts": 0}
 
     def do_span(span: Span) -> None:
+        if not state["ok"] and state["timeouts"] >= NO_REPLY_ABORT:
+            for r in span.regs:
+                errors[id(r)] = "skipped (inverter not responding)"
+            return
         try:
-            words = client.read_input(wire_address(span.start), span.count)
+            words = client.read(span.fc, span.start, span.count)
         except ModbusException as e:
-            # Part of the span may be unsupported on this model: split and retry
             if len(span.regs) > 1:
                 mid = len(span.regs) // 2
                 for half in (span.regs[:mid], span.regs[mid:]):
@@ -690,19 +756,24 @@ def read_regs(client: RtuClient, regs: list[Reg], log: Callable[[str], None]) ->
                         do_span(sub)
                 return
             for r in span.regs:
-                errors[r.addr] = str(e)
+                errors[id(r)] = str(e)
             return
         except ModbusError as e:
-            log(f"  ! {span.start}-{span.start + span.count - 1}: {e}")
+            if isinstance(e, ModbusTimeout):
+                state["timeouts"] += 1
+            log(f"  ! FC{span.fc:02d} {span.start}-{span.start + span.count - 1}: {e}")
             for r in span.regs:
-                errors[r.addr] = str(e)
+                errors[id(r)] = str(e)
             return
+        state["ok"] = True
         for r in span.regs:
             off = r.addr - span.start
-            raw[r.addr] = words[off:off + r.size]
+            raw[id(r)] = words[off:off + r.size]
 
     for span in build_spans(regs):
         do_span(span)
+    if not state["ok"] and state["timeouts"] >= NO_REPLY_ABORT:
+        raise NoResponse("inverter did not reply")
     return raw, errors
 
 
@@ -716,8 +787,17 @@ def _decimals(scale: float) -> int:
     return max(0, len(f"{scale:.6f}".rstrip("0").split(".")[1]))
 
 
-def _bits(v: int, table: dict) -> list[str]:
-    return [table.get(b, f"bit{b}") for b in range(16) if v >> b & 1]
+def _bits(v: int, table: dict, width: int = 16) -> list[str]:
+    return [table.get(b, f"bit{b}") for b in range(width) if v >> b & 1]
+
+
+def _s16(w: int) -> int:
+    return w - 0x10000 if w & 0x8000 else w
+
+
+def _bms_req(v: int) -> str:
+    names = {0: "invalid", 1: "no request", 2: "REQUEST", 3: "invalid"}
+    return f"force charge: {names[v & 3]}, heating: {names[v >> 2 & 3]}"
 
 
 def decode(r: Reg, words: list[int]) -> tuple[object, str]:
@@ -728,11 +808,14 @@ def decode(r: Reg, words: list[int]) -> tuple[object, str]:
         if t == "U16":
             v = w
         elif t == "S16":
-            v = w - 0x10000 if w & 0x8000 else w
+            v = _s16(w)
         else:
             v = (words[0] << 16) | words[1]
-            if t == "S32" and v & 0x80000000:
-                v -= 0x100000000
+            if t == "S32":
+                if v == 0x80000000:
+                    return None, "invalid / not present"
+                if v & 0x80000000:
+                    v -= 0x100000000
         val = round(v * r.scale, _decimals(r.scale)) if r.scale != 1 else v
         return val, f"{val} {r.unit}".strip()
     if t == "HEX":
@@ -742,9 +825,6 @@ def decode(r: Reg, words: list[int]) -> tuple[object, str]:
     if t == "BITS":
         active = _bits(w, r.table)
         return w, (", ".join(active) if active else "none") + f"  [0x{w:04X}]"
-    if t == "SNHEX":
-        sn = "".join(f"{x:04X}"[::-1] for x in words)
-        return sn, sn
     if t == "ASCII":
         b = b"".join(struct.pack(">H", x) for x in words)
         s = b.replace(b"\x00", b"").decode("ascii", "replace").strip()
@@ -753,6 +833,21 @@ def decode(r: Reg, words: list[int]) -> tuple[object, str]:
         y, mo, d, h, mi, s = words
         ts = f"20{y:02d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}:{s:02d}"
         return ts, ts
+    if t == "BATTMODEL":
+        lv, hv = w & 0xFF, w >> 8
+        parts = []
+        if hv:
+            parts.append(f"HV: {HV_BATTERY.get(hv, f'code 0x{hv:02X}')}")
+        if lv or not hv:
+            parts.append(f"LV: {LV_BATTERY.get(lv, f'code 0x{lv:02X}')}")
+        return w, ", ".join(parts) + f"  [0x{w:04X}]"
+    if t == "BMSREQ":
+        return w, _bms_req(w)
+    if t == "DISPATCH":
+        st = {0: "Not running", 1: "Default control (standby)", 2: "Real-time control", 3: "Timing control"}
+        md = {0: "-", 1: "Battery standby", 2: "Battery charge/discharge", 3: "Grid point import/export",
+              4: "AC port import/export", 5: "Self-use priority", 6: "Feed-in priority"}
+        return w, f"{st.get(w & 0xFF, hex(w & 0xFF))}, mode: {md.get(w >> 8, hex(w >> 8))}"
     return w, str(w)
 
 
@@ -763,6 +858,8 @@ def status_text(status: int, sub: int) -> str:
         return f"{base} - derating: {', '.join(flags) or f'0x{sub:04X}'}"
     if (status, sub) in STATUS_SUB:
         return STATUS_SUB[(status, sub)]
+    if status in (0x1800, 0x1801) and sub:
+        return f"{base} - DC input {sub}"
     if sub:
         return f"{base} (sub-code {sub:02d})"
     return base
@@ -777,55 +874,90 @@ class Result:
     error: str = ""
 
 
-def poll(client: RtuClient, groups: list[str], respect_dc_type: bool, log: Callable[[str], None]) -> dict[str, Result]:
+def _calc(results: dict[str, Result], key: str, name: str, group_: str, value, text: str, unit: str = "") -> None:
+    results[key] = Result(Reg(0, key, name, unit=unit, group=group_), [], value, text)
+
+
+def _ok(results: dict[str, Result], *keys: str) -> bool:
+    return all(k in results and results[k].raw for k in keys)
+
+
+def poll(client: RtuClient, groups: list[str], log: Callable[[str], None]) -> dict[str, Result]:
     results: dict[str, Result] = {}
+    regs = [r for r in REGS if r.group in groups]
+    raw, errors = read_regs(client, regs, log)
+    for r in regs:
+        if id(r) in raw:
+            v, txt = decode(r, raw[id(r)])
+            results[r.key] = Result(r, raw[id(r)], v, txt)
+        else:
+            results[r.key] = Result(r, None, error=errors.get(id(r), "not read"))
 
-    def run(regs: list[Reg]) -> None:
-        raw, errors = read_regs(client, regs, log)
-        for r in regs:
-            if r.addr in raw:
-                v, txt = decode(r, raw[r.addr])
-                results[r.key] = Result(r, raw[r.addr], v, txt)
-            else:
-                results[r.key] = Result(r, None, error=errors.get(r.addr, "not read"))
+    # ---- derived values ----
+    if _ok(results, "inverter_status"):
+        st = results["inverter_status"]
+        sub = results["alarm_code"].raw[0] if _ok(results, "alarm_code") else 0
+        st.text = f"{status_text(st.raw[0], sub)}  [0x{st.raw[0]:04X}]"
 
-    gated = {"strings", "mppt"}
-    run([r for r in REGS if r.group in groups and r.group not in gated])
+    if _ok(results, "dsp_major", "dsp_sub"):
+        v = f"{results['dsp_major'].raw[0] & 0xFF:02X}{results['dsp_sub'].raw[0] & 0xFF:02X}"
+        _calc(results, "dsp_version", "DSP firmware version", "info", v, v)
+    if _ok(results, "hmi_major", "hmi_sub"):
+        v = f"{results['hmi_major'].raw[0] & 0xFF:02X}{results['hmi_sub'].raw[0] & 0xFF:02X}"
+        _calc(results, "hmi_version", "HMI firmware version", "info", v, v)
+    n_pv = 10
+    if _ok(results, "dc_input_type"):
+        d = results["dc_input_type"]
+        d.value = d.raw[0] + 1
+        d.text = f"{d.value} PV input(s)"
+        if 1 <= d.value <= 10:
+            n_pv = d.value
+            for i in range(n_pv + 1, 11):
+                results.pop(f"pv{i}_voltage", None)
+                results.pop(f"pv{i}_current", None)
 
-    want = [g for g in groups if g in gated]
-    if want:
-        n_inputs = None
-        dct = results.get("dc_input_type")
-        if dct is None:
-            run([r for r in REGS if r.key == "dc_input_type"])
-            dct = results.pop("dc_input_type")
-        if dct.raw:
-            n_inputs = dct.raw[0]
-        if respect_dc_type and n_inputs is not None:
-            # Section 5.2 / reg 3004: >=4 -> 3287-3338, >=8 -> 3500-3546
-            want = [g for g in want if (g == "strings" and n_inputs >= 4) or (g == "mppt" and n_inputs >= 8)]
-        if want:
-            run([r for r in REGS if r.group in want])
+    for i in range(1, n_pv + 1):
+        if _ok(results, f"pv{i}_voltage", f"pv{i}_current"):
+            v, c = results[f"pv{i}_voltage"].value, results[f"pv{i}_current"].value
+            p = round(v * c, 1)
+            _calc(results, f"pv{i}_power", f"PV{i} power (V x I)", "pv", p, f"{p} W", "W")
 
-    # Derived values
-    st, al = results.get("inverter_status"), results.get("alarm_code")
-    if st and st.raw:
-        st.text = f"{status_text(st.raw[0], al.raw[0] if al and al.raw else 0)}  [0x{st.raw[0]:04X}]"
-    dct = results.get("dc_input_type")
-    if dct and dct.raw:
-        dct.value = dct.raw[0] + 1
-        dct.text = f"{dct.value} DC input(s)"
-    te, td = results.get("total_energy"), results.get("total_energy_decimal")
-    if te and te.raw and td and td.raw:
-        te.value = round(te.value + td.value, 3)
-        te.text = f"{te.value} kWh"
-    for i in range(1, 5):
-        v, c = results.get(f"dc_voltage_{i}"), results.get(f"dc_current_{i}")
-        if v and c and v.raw and c.raw:
-            key = f"dc_power_{i}"
-            p = round(v.value * c.value, 1)
-            reg = Reg(0, key, f"DC power {i} (V x I)", unit="W", group="dc")
-            results[key] = Result(reg, [], p, f"{p} W")
+    # Battery: magnitude + direction register -> signed (+ charge, - discharge)
+    for n, (cur, pw, dr) in {"1": ("battery_current", "battery_power", "battery_direction"),
+                             "2": ("battery2_current", "battery2_power", "battery2_direction")}.items():
+        grp = "battery" if n == "1" else "battery2"
+        if _ok(results, pw, dr) and results[pw].value is not None:
+            sign = -1 if results[dr].raw[0] == 1 else 1
+            p = sign * abs(results[pw].value)
+            state = "idle" if p == 0 else ("charging" if p > 0 else "discharging")
+            _calc(results, f"battery{n}_power_signed", "Power (+charge / -discharge)", grp, p, f"{p} W ({state})", "W")
+        if _ok(results, cur, dr):
+            sign = -1 if results[dr].raw[0] == 1 else 1
+            c = round(sign * abs(results[cur].value), 1)
+            _calc(results, f"battery{n}_current_signed", "Current (+charge / -discharge)", grp, c, f"{c} A", "A")
+
+    # Grid load power: 33147 low + 34343 high (U32)
+    if _ok(results, "grid_load_power_lo"):
+        hi = results["grid_load_power_hi"].raw[0] if _ok(results, "grid_load_power_hi") else 0
+        p = (hi << 16) | results["grid_load_power_lo"].raw[0]
+        _calc(results, "grid_load_power", "Grid load power (excl. backup)", "load", p, f"{p} W", "W")
+    for k in ("grid_load_power_lo", "grid_load_power_hi"):
+        results.pop(k, None)
+
+    # Backup load power: 33148 alone (S16) up to 20 kW, combined with 34344 (S32) above
+    if _ok(results, "backup_power_lo"):
+        lo = results["backup_power_lo"].raw[0]
+        hi = results["backup_power_hi"].raw[0] if _ok(results, "backup_power_hi") else 0
+        rated = results["rated_apparent_power"].value if _ok(results, "rated_apparent_power") else 0
+        if rated > 20000 or hi not in (0, 0xFFFF):
+            v = (hi << 16) | lo
+            p = v - 0x100000000 if v & 0x80000000 else v
+        else:
+            p = _s16(lo)
+        _calc(results, "backup_power", "Backup load power (+out of port)", "backup", p, f"{p} W", "W")
+    for k in ("backup_power_lo", "backup_power_hi"):
+        results.pop(k, None)
+
     return results
 
 
@@ -834,14 +966,14 @@ def poll(client: RtuClient, groups: list[str], respect_dc_type: bool, log: Calla
 # --------------------------------------------------------------------------
 
 def print_table(results: dict[str, Result], show_raw: bool, show_errors: bool) -> None:
-    print(f"\n=== Solis inverter  {datetime.now():%Y-%m-%d %H:%M:%S} ===")
+    print(f"\n=== Solis hybrid inverter  {datetime.now():%Y-%m-%d %H:%M:%S} ===")
     for gkey, title in GROUPS.items():
         rows = [r for r in results.values() if r.reg.group == gkey and (r.raw is not None or show_errors)]
         if not rows:
             continue
         print(f"\n[{title}]")
         for res in rows:
-            addr = f"{res.reg.addr:>5}" if res.reg.addr else "  calc"
+            addr = f"{res.reg.addr:>5}" if res.reg.addr else " calc"
             if res.raw is None:
                 text = f"-- {res.error}"
             else:
@@ -865,7 +997,7 @@ def append_csv(path: str, results: dict[str, Result]) -> None:
     row = {"timestamp": datetime.now().isoformat(timespec="seconds")}
     for k, r in results.items():
         if r.raw is not None:
-            row[k] = r.value if not isinstance(r.value, list) else ";".join(map(str, r.value))
+            row[k] = r.value
     new = not os.path.exists(path) or os.path.getsize(path) == 0
     if not new:
         with open(path, newline="", encoding="utf-8") as f:
@@ -892,52 +1024,64 @@ def append_csv(path: str, results: dict[str, Result]) -> None:
 # CLI
 # --------------------------------------------------------------------------
 
+NO_REPLY_HINT = """No reply from the inverter. Check:
+  - RS485 A/B wiring (try swapping A and B), and GND if available
+  - slave address (--unit) and baud rate (--baud) match the inverter settings
+  - no datalogger stick is polling the same RS485 port
+  - Raspberry Pi: serial console disabled, and the RS485 board handles DE/RE direction"""
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Read all operating data from a Solis grid-tied inverter over Modbus RTU (RS485).")
-    ap.add_argument("--port", help="serial port, e.g. COM5 or /dev/ttyUSB0")
+    ap = argparse.ArgumentParser(description="Read operating data from a Solis hybrid inverter over Modbus RTU (RS485).")
+    ap.add_argument("--port", help="serial port, e.g. COM5, /dev/ttyUSB0 or /dev/serial0")
     ap.add_argument("--unit", type=int, default=1, help="inverter slave address (default 1)")
     ap.add_argument("--baud", type=int, default=9600)
     ap.add_argument("--timeout", type=float, default=1.0, help="response timeout in seconds")
     ap.add_argument("--retries", type=int, default=1, help="retries on timeout/CRC error")
     ap.add_argument("--groups", default=",".join(DEFAULT_GROUPS),
-                    help=f"comma separated groups (default all): {','.join(DEFAULT_GROUPS)}")
-    ap.add_argument("--force-all", action="store_true",
-                    help="read PV string / MPPT groups even if register 3004 says the model doesn't have them")
+                    help=f"comma separated groups, or 'all'. Default: {','.join(DEFAULT_GROUPS)}. "
+                         f"Available: {','.join(ALL_GROUPS)}")
     ap.add_argument("--interval", type=float, default=0, help="poll repeatedly every N seconds")
     ap.add_argument("--json", action="store_true", help="print JSON instead of a table")
     ap.add_argument("--csv", metavar="FILE", help="append each poll as a row to a CSV file")
     ap.add_argument("--raw", action="store_true", help="show raw register words")
-    ap.add_argument("--show-unsupported", action="store_true", help="list registers the inverter refused")
+    ap.add_argument("--show-unsupported", action="store_true", help="also list registers that could not be read")
     ap.add_argument("--list-ports", action="store_true", help="list serial ports and exit")
     args = ap.parse_args(argv)
 
     if args.list_ports:
         from serial.tools import list_ports
         for p in list_ports.comports():
-            print(f"{p.device:<12} {p.description}")
+            print(f"{p.device:<14} {p.description}")
         return 0
     if not args.port:
         ap.error("--port is required (use --list-ports to find it)")
 
-    groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    groups = ALL_GROUPS if args.groups.strip() == "all" else [g.strip() for g in args.groups.split(",") if g.strip()]
     bad = [g for g in groups if g not in GROUPS]
     if bad:
         ap.error(f"unknown group(s): {', '.join(bad)}")
 
     log = (lambda m: print(m, file=sys.stderr))
     client = RtuClient(args.port, args.unit, args.baud, args.timeout, args.retries)
+    rc = 0
     try:
         while True:
             t0 = time.monotonic()
-            results = poll(client, groups, not args.force_all, log)
-            if not any(r.raw is not None for r in results.values()):
-                log("No data received - check wiring (A/B), slave address, baud rate and that the inverter is powered.")
-            elif args.json:
-                print(json.dumps(to_dict(results), indent=2, ensure_ascii=False))
-            else:
-                print_table(results, args.raw, args.show_unsupported)
-            if args.csv:
-                append_csv(args.csv, results)
+            try:
+                results = poll(client, groups, log)
+            except NoResponse:
+                log(NO_REPLY_HINT)
+                rc = 1
+                results = None
+            if results:
+                rc = 0
+                if args.json:
+                    print(json.dumps(to_dict(results), indent=2, ensure_ascii=False))
+                else:
+                    print_table(results, args.raw, args.show_unsupported)
+                if args.csv:
+                    append_csv(args.csv, results)
             if args.interval <= 0:
                 break
             time.sleep(max(0.0, args.interval - (time.monotonic() - t0)))
@@ -945,7 +1089,7 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         client.close()
-    return 0
+    return rc
 
 
 if __name__ == "__main__":
