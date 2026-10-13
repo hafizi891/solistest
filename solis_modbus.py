@@ -897,7 +897,12 @@ def poll(client: RtuClient, groups: list[str], log: Callable[[str], None]) -> di
     if _ok(results, "inverter_status"):
         st = results["inverter_status"]
         sub = results["alarm_code"].raw[0] if _ok(results, "alarm_code") else 0
-        st.text = f"{status_text(st.raw[0], sub)}  [0x{st.raw[0]:04X}]"
+        if st.raw[0] not in STATUS and _ok(results, "operating_status") and results["operating_status"].raw[0]:
+            # Code not listed in Appendix 3: describe it with the 33121 operating status bits instead
+            bits = ", ".join(_bits(results["operating_status"].raw[0], BITS_33121))
+            st.text = f"{bits} (status code not in protocol)  [0x{st.raw[0]:04X}]"
+        else:
+            st.text = f"{status_text(st.raw[0], sub)}  [0x{st.raw[0]:04X}]"
 
     if _ok(results, "dsp_major", "dsp_sub"):
         v = f"{results['dsp_major'].raw[0] & 0xFF:02X}{results['dsp_sub'].raw[0] & 0xFF:02X}"

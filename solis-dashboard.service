@@ -5,6 +5,7 @@ After=network.target
 [Service]
 User=hafizi891
 WorkingDirectory=/home/hafizi891/solistest
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/hafizi891/solistest/webapp.py --port /dev/serial0 --unit 1 --interval 10
 Restart=always
 RestartSec=5

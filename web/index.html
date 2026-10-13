@@ -190,9 +190,13 @@ function render(snap) {
   const sn = v("serial_number");
   $("model").textContent = [model, sn ? "SN " + sn : "", snap.demo ? "demo data" : ""].filter(Boolean).join(" · ");
 
-  const code = v("inverter_status");
+  const code = v("inverter_status"), op = v("operating_status");
+  let level = "";
+  if (code !== null && code >= 0xF000) level = "warn";
+  else if (op) level = op & 0x8708 ? "bad" : op & 0x0001 ? "ok" : "";  // fault/grid/battery/load bits, else normal
+  else if (code !== null) level = code <= 4 ? "ok" : "bad";
   const pill = $("status");
-  pill.className = "pill " + (code === null ? "" : code <= 4 ? "ok" : code >= 0xF000 ? "warn" : "bad");
+  pill.className = "pill " + level;
   $("status-text").textContent = flat.inverter_status ? flat.inverter_status.text.replace(/\s+\[0x[0-9A-F]+\]$/, "") : "Unknown";
   $("updated").textContent = snap.last_ok ? "Updated " + new Date(snap.last_ok * 1000).toLocaleTimeString() : "";
 
