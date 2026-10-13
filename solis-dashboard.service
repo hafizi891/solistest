@@ -1,0 +1,13 @@
+[Unit]
+Description=Solis inverter web dashboard
+After=network.target
+
+[Service]
+User=hafizi891
+WorkingDirectory=/home/hafizi891/solistest
+ExecStart=/usr/bin/python3 /home/hafizi891/solistest/webapp.py --port /dev/serial0 --unit 1 --interval 10
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

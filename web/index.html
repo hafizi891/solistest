@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solis Dashboard</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --text: #1c2330; --muted: #667085; --line: #e4e7ec;
+    --pv: #d97706; --batt: #16a34a; --grid: #2563eb; --load: #9333ea;
+    --ok: #16a34a; --warn: #d97706; --bad: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f141b; --card: #171e28; --text: #e6e9ef; --muted: #8b95a7; --line: #262f3c;
+      --pv: #f59e0b; --batt: #22c55e; --grid: #60a5fa; --load: #c084fc;
+      --ok: #22c55e; --warn: #f59e0b; --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-bottom: 20px; }
+  header h1 { font-size: 20px; margin: 0; font-weight: 650; }
+  .model { color: var(--muted); font-size: 13px; }
+  .spacer { flex: 1; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 999px;
+    background: var(--card); border: 1px solid var(--line); font-size: 13px; font-weight: 550;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .pill.ok .dot { background: var(--ok); }
+  .pill.warn .dot { background: var(--warn); }
+  .pill.bad .dot { background: var(--bad); }
+  .updated { color: var(--muted); font-size: 13px; }
+
+  .banner {
+    display: none; margin-bottom: 16px; padding: 10px 14px; border-radius: 10px;
+    border: 1px solid var(--bad); color: var(--bad); background: var(--card); font-size: 14px;
+  }
+  .banner.show { display: block; }
+
+  .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; }
+  .tile { border-top: 3px solid var(--accent); }
+  .tile .label { color: var(--muted); font-size: 13px; font-weight: 550; text-transform: uppercase; letter-spacing: .04em; }
+  .tile .value { font-size: 30px; font-weight: 650; margin: 6px 0 2px; font-variant-numeric: tabular-nums; }
+  .tile .sub { color: var(--muted); font-size: 13px; min-height: 19px; }
+  .soc { height: 8px; border-radius: 4px; background: var(--line); margin-top: 10px; overflow: hidden; }
+  .soc > div { height: 100%; width: 0; background: var(--batt); transition: width .6s; }
+
+  h2 { font-size: 15px; margin: 28px 0 10px; font-weight: 650; }
+  .energy { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; }
+  .energy .card { padding: 12px 14px; }
+  .energy .k { color: var(--muted); font-size: 12px; }
+  .energy .v { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+
+  .chart-head { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; margin-bottom: 8px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; color: var(--muted); }
+  .legend span::before {
+    content: ""; display: inline-block; width: 10px; height: 3px; border-radius: 2px;
+    background: var(--c); margin-right: 6px; vertical-align: middle;
+  }
+  .readout { margin-left: auto; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  canvas { display: block; width: 100%; height: 260px; }
+
+  .details-bar { display: flex; gap: 10px; align-items: center; margin: 28px 0 10px; }
+  .details-bar h2 { margin: 0; }
+  input[type=search] {
+    margin-left: auto; width: 220px; max-width: 50%; padding: 7px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--card); color: var(--text); font: inherit; font-size: 14px;
+  }
+  .groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
+  details.card { padding: 0; }
+  summary { cursor: pointer; padding: 12px 16px; font-weight: 600; list-style: none; display: flex; }
+  summary::-webkit-details-marker { display: none; }
+  summary::after { content: "+"; margin-left: auto; color: var(--muted); }
+  details[open] summary::after { content: "\2212"; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  td { padding: 6px 16px; border-top: 1px solid var(--line); vertical-align: top; }
+  td.reg { color: var(--muted); width: 1%; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.val { text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .empty { color: var(--muted); padding: 24px 0; }
+
+  @media (max-width: 900px) {
+    .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .energy { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .groups { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 480px) {
+    .tile .value { font-size: 24px; }
+    .energy { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    canvas { height: 200px; }
+    .readout { margin-left: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Solis Hybrid Inverter</h1>
+      <div class="model" id="model">Connecting…</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="pill" id="status"><span class="dot"></span><span id="status-text">Waiting for data</span></div>
+    <div class="updated" id="updated"></div>
+  </header>
+
+  <div class="banner" id="banner"></div>
+
+  <section class="tiles">
+    <div class="card tile" style="--accent: var(--pv)">
+      <div class="label">Solar</div>
+      <div class="value" id="pv">–</div>
+      <div class="sub" id="pv-sub"></div>
+    </div>
+    <div class="card tile" style="--accent: var(--batt)">
+      <div class="label">Battery</div>
+      <div class="value" id="batt">–</div>
+      <div class="sub" id="batt-sub"></div>
+      <div class="soc"><div id="soc-bar"></div></div>
+    </div>
+    <div class="card tile" style="--accent: var(--grid)">
+      <div class="label">Grid</div>
+      <div class="value" id="grid">–</div>
+      <div class="sub" id="grid-sub"></div>
+    </div>
+    <div class="card tile" style="--accent: var(--load)">
+      <div class="label">Home</div>
+      <div class="value" id="load">–</div>
+      <div class="sub" id="load-sub"></div>
+    </div>
+  </section>
+
+  <h2>Today</h2>
+  <section class="energy" id="energy"></section>
+
+  <h2>Power history</h2>
+  <section class="card">
+    <div class="chart-head">
+      <div class="legend">
+        <span style="--c: var(--pv)">Solar</span>
+        <span style="--c: var(--load)">Home</span>
+        <span style="--c: var(--grid)">Grid (+export)</span>
+        <span style="--c: var(--batt)">Battery (+charge)</span>
+      </div>
+      <div class="readout" id="readout"></div>
+    </div>
+    <canvas id="chart"></canvas>
+  </section>
+
+  <div class="details-bar">
+    <h2>All values</h2>
+    <input type="search" id="filter" placeholder="Filter…" aria-label="Filter values">
+  </div>
+  <section class="groups" id="groups"><div class="empty">No data yet.</div></section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let flat = {}, history = [], hoverIdx = null, openGroups = new Set(["status", "battery"]);
+
+function fmtW(w) {
+  if (w === null || w === undefined) return "–";
+  const a = Math.abs(w);
+  return a >= 1000 ? (a / 1000).toFixed(2) + " kW" : Math.round(a) + " W";
+}
+const v = k => (flat[k] ? flat[k].value : null);
+const kwh = k => (v(k) === null ? "–" : v(k).toFixed(1) + " kWh");
+
+function render(snap) {
+  const banner = $("banner");
+  if (snap.error && snap.error !== "starting") {
+    banner.textContent = (snap.data ? "Showing last good reading. " : "") + snap.error;
+    banner.classList.add("show");
+  } else banner.classList.remove("show");
+
+  if (!snap.data) return;
+  flat = {};
+  for (const [g, items] of Object.entries(snap.data)) {
+    if (g === "timestamp") continue;
+    for (const [k, item] of Object.entries(items)) flat[k] = { ...item, group: g };
+  }
+
+  const model = flat.inverter_type ? flat.inverter_type.text : "";
+  const sn = v("serial_number");
+  $("model").textContent = [model, sn ? "SN " + sn : "", snap.demo ? "demo data" : ""].filter(Boolean).join(" · ");
+
+  const code = v("inverter_status");
+  const pill = $("status");
+  pill.className = "pill " + (code === null ? "" : code <= 4 ? "ok" : code >= 0xF000 ? "warn" : "bad");
+  $("status-text").textContent = flat.inverter_status ? flat.inverter_status.text.replace(/\s+\[0x[0-9A-F]+\]$/, "") : "Unknown";
+  $("updated").textContent = snap.last_ok ? "Updated " + new Date(snap.last_ok * 1000).toLocaleTimeString() : "";
+
+  $("pv").textContent = fmtW(v("pv_power"));
+  $("pv-sub").textContent = "Today " + kwh("pv_energy_today");
+
+  const bp = v("battery1_power_signed"), soc = v("battery_soc");
+  $("batt").textContent = soc === null ? "–" : soc + "%";
+  $("batt-sub").textContent = bp === null ? "" : bp > 0 ? "Charging " + fmtW(bp) : bp < 0 ? "Discharging " + fmtW(bp) : "Idle";
+  $("soc-bar").style.width = (soc || 0) + "%";
+
+  const gp = v("meter_active_power");
+  $("grid").textContent = fmtW(gp);
+  $("grid-sub").textContent = gp === null ? "" : gp > 0 ? "Exporting" : gp < 0 ? "Importing" : "Balanced";
+
+  const home = (v("grid_load_power") || 0) + Math.max(v("backup_power") || 0, 0);
+  $("load").textContent = fmtW(home);
+  $("load-sub").textContent = "Backup " + fmtW(v("backup_power")) + " · Today " + kwh("load_energy_today");
+
+  const energy = [
+    ["Solar", "pv_energy_today"], ["Home", "load_energy_today"],
+    ["Battery charged", "battery_charge_today"], ["Battery discharged", "battery_discharge_today"],
+    ["Grid import", "grid_import_today"], ["Grid export", "grid_export_today"],
+  ];
+  $("energy").replaceChildren(...energy.map(([label, key]) => {
+    const c = document.createElement("div");
+    c.className = "card";
+    c.innerHTML = '<div class="k"></div><div class="v"></div>';
+    c.firstChild.textContent = label;
+    c.lastChild.textContent = kwh(key);
+    return c;
+  }));
+
+  renderGroups(snap);
+}
+
+function renderGroups(snap) {
+  const q = $("filter").value.trim().toLowerCase();
+  const wrap = $("groups");
+  document.querySelectorAll("#groups details").forEach(d => d.open ? openGroups.add(d.dataset.g) : openGroups.delete(d.dataset.g));
+  const out = [];
+  for (const [g, items] of Object.entries(snap.data)) {
+    if (g === "timestamp") continue;
+    const rows = Object.entries(items).filter(([k, it]) => {
+      if (!q) return true;
+      const name = (snap.titles[g] || "") + " " + k + " " + it.text + " " + (it.register || "");
+      return name.toLowerCase().includes(q);
+    });
+    if (!rows.length) continue;
+    const d = document.createElement("details");
+    d.className = "card";
+    d.dataset.g = g;
+    d.open = !!q || openGroups.has(g);
+    const s = document.createElement("summary");
+    s.textContent = snap.titles[g] || g;
+    const t = document.createElement("table");
+    for (const [k, it] of rows) {
+      const tr = t.insertRow();
+      tr.insertCell().textContent = k.replace(/_/g, " ");
+      const val = tr.insertCell(); val.className = "val"; val.textContent = it.text;
+      const reg = tr.insertCell(); reg.className = "reg"; reg.textContent = it.register || "calc";
+    }
+    d.append(s, t);
+    out.push(d);
+  }
+  wrap.replaceChildren(...(out.length ? out : [Object.assign(document.createElement("div"), { className: "empty", textContent: "Nothing matches." })]));
+}
+
+const SERIES = [["pv", "--pv"], ["load", "--load"], ["grid", "--grid"], ["battery", "--batt"]];
+
+function drawChart() {
+  const cv = $("chart"), ctx = cv.getContext("2d");
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const css = getComputedStyle(document.documentElement);
+  const muted = css.getPropertyValue("--muted"), line = css.getPropertyValue("--line");
+  ctx.font = "12px system-ui, sans-serif";
+
+  if (history.length < 2) {
+    ctx.fillStyle = muted; ctx.fillText("Collecting data…", 12, 24);
+    return;
+  }
+  const L = 52, R = 10, T = 10, B = 24, pw = W - L - R, ph = H - T - B;
+  const t0 = history[0].t, t1 = history[history.length - 1].t;
+  let lo = 0, hi = 0;
+  for (const p of history) for (const [k] of SERIES) if (p[k] != null) { lo = Math.min(lo, p[k]); hi = Math.max(hi, p[k]); }
+  if (hi - lo < 100) hi = lo + 100;
+  const step = niceStep((hi - lo) / 4);
+  lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
+  const x = t => L + (t - t0) / Math.max(t1 - t0, 1) * pw;
+  const y = w => T + (hi - w) / (hi - lo) * ph;
+
+  ctx.strokeStyle = line; ctx.fillStyle = muted; ctx.lineWidth = 1;
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let w = lo; w <= hi + 1e-6; w += step) {
+    ctx.beginPath(); ctx.moveTo(L, y(w)); ctx.lineTo(W - R, y(w)); ctx.stroke();
+    ctx.fillText(Math.abs(step) >= 1000 ? (w / 1000) + " kW" : w + " W", L - 6, y(w));
+  }
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let i = 0; i <= 4; i++) {
+    const t = t0 + (t1 - t0) * i / 4;
+    ctx.fillText(new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), Math.min(Math.max(x(t), L + 18), W - R - 18), H - B + 6);
+  }
+
+  ctx.lineWidth = 2; ctx.lineJoin = "round";
+  for (const [k, c] of SERIES) {
+    ctx.strokeStyle = css.getPropertyValue(c); ctx.beginPath();
+    let started = false;
+    for (const p of history) {
+      if (p[k] == null) { started = false; continue; }
+      started ? ctx.lineTo(x(p.t), y(p[k])) : ctx.moveTo(x(p.t), y(p[k]));
+      started = true;
+    }
+    ctx.stroke();
+  }
+
+  if (hoverIdx !== null && history[hoverIdx]) {
+    const p = history[hoverIdx];
+    ctx.strokeStyle = muted; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x(p.t), T); ctx.lineTo(x(p.t), T + ph); ctx.stroke();
+    $("readout").textContent = new Date(p.t).toLocaleTimeString() + " · Solar " + fmtW(p.pv) + " · Home " + fmtW(p.load) +
+      " · Grid " + (p.grid == null ? "–" : (p.grid >= 0 ? "+" : "−") + fmtW(p.grid)) +
+      " · Battery " + (p.battery == null ? "–" : (p.battery >= 0 ? "+" : "−") + fmtW(p.battery)) +
+      (p.soc == null ? "" : " (" + p.soc + "%)");
+  } else $("readout").textContent = "";
+}
+
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const n = raw / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p;
+}
+
+$("chart").addEventListener("pointermove", e => {
+  if (history.length < 2) return;
+  const r = e.target.getBoundingClientRect(), L = 52, pw = r.width - L - 10;
+  const t = history[0].t + (e.clientX - r.left - L) / pw * (history[history.length - 1].t - history[0].t);
+  let best = 0;
+  for (let i = 1; i < history.length; i++) if (Math.abs(history[i].t - t) < Math.abs(history[best].t - t)) best = i;
+  hoverIdx = best; drawChart();
+});
+$("chart").addEventListener("pointerleave", () => { hoverIdx = null; drawChart(); });
+window.addEventListener("resize", drawChart);
+
+let lastSnap = null;
+$("filter").addEventListener("input", () => lastSnap && lastSnap.data && renderGroups(lastSnap));
+
+async function refresh() {
+  try {
+    const [snap, hist] = await Promise.all([
+      fetch("api/data").then(r => r.json()),
+      fetch("api/history").then(r => r.json()),
+    ]);
+    lastSnap = snap; history = hist;
+    render(snap); drawChart();
+    setTimeout(refresh, Math.max(2, Math.min(snap.interval || 10, 30)) * 1000);
+  } catch (e) {
+    $("banner").textContent = "Cannot reach the dashboard server. Retrying…";
+    $("banner").classList.add("show");
+    setTimeout(refresh, 5000);
+  }
+}
+refresh();
+</script>
+</body>
+</html>
